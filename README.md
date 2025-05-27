@@ -49,11 +49,6 @@ This project contains **two independent modules**, each built using a different 
 
 ---
 
-## GUI Preview
-
-*(Add screenshots here of both ISSM and NDD GUIs)*
-
----
 
 ## Windows Executable
 - `in_silico_project_ver3.2.4.exe`: General user version  
