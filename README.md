@@ -1,4 +1,4 @@
-# In Silico Sequence Mining Tool
+# NGS Dataset downloader(NDD) & In Silico Sequence Mining (ISSM)
 
 A graphical Python tool for mining, matching, and downloading NGS data (SRA/ENA) with probe-based sequence detection and parallel processing support.
 
