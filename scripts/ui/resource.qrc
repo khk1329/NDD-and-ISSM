@@ -1,0 +1,7 @@
+<RCC>
+  <qresource prefix="icons">
+    <file>icons/IDL_mark.PNG</file>
+    <file>icons/circle-check.png</file>
+    <file>icons/circle-dashed.png</file>
+  </qresource>
+</RCC>
