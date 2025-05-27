@@ -120,9 +120,7 @@ pillow
 ## License
 
 This project is licensed under the **MIT License**.  
-See the [LICENSE](LICENSE) file for details.
-
-> PySide6 is under LGPL 3.0 — dynamic linking is recommended for distribution.
+See the LICENSE file for details.
 
 ---
 
