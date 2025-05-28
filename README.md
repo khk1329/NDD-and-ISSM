@@ -128,7 +128,7 @@ See the LICENSE file for details.
 
 | Library         | License      |
 |----------------|--------------|
-| Biopython      | BSD          |
+| Biopython      |              |
 | PySide6        | LGPL 3.0     |
 | psutil         | BSD          |
 | matplotlib     | PSF          |
