@@ -119,7 +119,7 @@ pillow
 
 ## License
 
-This project is licensed under the **MIT License**.  
+This project is licensed under the **MIT, Gnu Lesser General Public, Apache, BSD 3-Clause, The Python Imaging Library (PIL), Matplotlib License**.  
 See the LICENSE file for details.
 
 ---
