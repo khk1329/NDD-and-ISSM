@@ -119,7 +119,7 @@ pillow
 
 ## License
 
-This project is licensed under the **MIT**.  
+This project is licensed under the **Modified MIT**.  
 See the LICENSE file for details.
 
 ---
