@@ -1,3 +1,11 @@
+# Windows Executable
+
+Latest release: in_silico_project_ver3.2.4.exe
+
+※ Download from Releases → Assets
+
+Note: Do not use “Code → Download ZIP”. That only contains the source code and will include LFS pointer files instead of the real executable.
+
 # NGS Dataset downloader(NDD) & In Silico Sequence Mining (ISSM)
 
 A graphical Python tool for mining, matching, and downloading NGS data (SRA/ENA) with probe-based sequence detection and parallel processing support.
@@ -46,12 +54,6 @@ This project contains **two independent modules**, each built using a different 
 - Lightweight UI for searching, filtering, and downloading datasets from SRA/ENA
 - Modules:
   - `NGS_data_downloader.py`
-
----
-
-
-## Windows Executable
-- `in_silico_project_ver3.2.4.exe`: General user version  
 
 ---
 
