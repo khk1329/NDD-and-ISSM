@@ -42,8 +42,10 @@ import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from queue import Queue
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from ui.ISSM import Ui_In_silico_sequence_mining
-from ui import resource_rc
 
 matplotlib.use('Agg')
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
@@ -291,76 +293,61 @@ def match_batch_reads(records, probes, threshold, batch_index):
     return matched, batch_index, batch_size
 
 def run_analysis(
-    probes_text_widget, threshold_entry, percentage_entry, output_file_entry,
-    selected_file_list_box, selected_file_paths, file_format_var,
-    analysis_cancelled, update_queue,
-    use_custom_parallel, custom_parallel_value 
+    probe_text: str,
+    threshold: int,
+    sampling_percentage: float,
+    output_dir_path: str,
+    selected_files: list,
+    selected_format: str,
+    analysis_cancelled,
+    update_queue,
+    use_custom_parallel: bool,
+    custom_parallel_value: int
 ):
-    logging.debug("🔬 Analysis started")
+    logging.debug("Analysis started.")
+    logging.debug(f"Selected format: {selected_format}")
+    logging.debug(f"Output directory: {output_dir_path}")
+    logging.debug(f"Files ({len(selected_files)}): {selected_files[:5]}{'...' if len(selected_files)>5 else ''}")
+    logging.debug(f"Parameters — Threshold={threshold}, Sampling={sampling_percentage}%, Parallel={use_custom_parallel}:{custom_parallel_value}")
 
-    if hasattr(file_format_var, 'text'):
-        selected_format = file_format_var.text().lower()
-    elif hasattr(file_format_var, 'currentText'):
-        selected_format = file_format_var.currentText().lower()
-    else:
-        selected_format = str(file_format_var).lower()
+    probes = []
+    for chunk in [c for c in probe_text.strip().split('>') if c.strip()]:
+        lines = chunk.splitlines()
+        name = lines[0].strip() if lines else ""
+        seq = ''.join(lines[1:]).strip().replace(' ', '')
+        if not name or not seq:
+            raise ValueError("Invalid probe entry (name/sequence is empty).")
+        probes.append((name, seq))
+    logging.debug(f"Probes parsed: {len(probes)}")
+    if probes:
+        logging.debug(f"Example probe — {probes[0][0]}: {probes[0][1][:30]}{'...' if len(probes[0][1])>30 else ''}")
 
-    probes_text = probes_text_widget.toPlainText().strip()
-    if not probes_text:
-        QMessageBox.warning(None, "Warning", "Please enter probe sequences")
-        return
+    cached_sequences = prepare_probe_sequences(probes)
+    logging.debug(f"Cached sequences prepared: {len(cached_sequences)} keys.")
 
-    try:
-        probes = [
-            (lines.split('\n')[0], ''.join(lines.split('\n')[1:]))
-            for lines in probes_text.strip().split('>') if lines.strip()
-        ]
-        cached_sequences = prepare_probe_sequences(probes)
-    except ValueError as e:
-        QMessageBox.critical(None, "Error", str(e))
-        return
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    summary_path = os.path.join(output_dir_path, f"summary_result_{ts}.txt")
+    logging.debug(f"Summary will be written to: {summary_path}")
 
-    try:
-        threshold = int(threshold_entry.text())
-        sampling_percentage = float(percentage_entry.text())
-    except ValueError:
-        QMessageBox.critical(None, "Error", "Threshold / Sampling value is invalid")
-        return
-
-    output_dir_path = output_file_entry.text().strip()
-    if not output_dir_path:
-        QMessageBox.warning(None, "Warning", "Please select an output directory")
-        return
-
-    selected_files = [
-        selected_file_paths.get(selected_file_list_box.item(i).text())
-        for i in range(selected_file_list_box.count())
-    ]
-    selected_files = [f for f in selected_files if f]
-
-    if not selected_files:
-        QMessageBox.warning(None, "Warning", "Please select files to analyze")
-        return
-    
+    results = {"file_results": {}, "probe_results": {}}
     completed_files = {'count': 0}
     total_files = len(selected_files)
-    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    summary_file_path = os.path.join(output_dir_path, f"summary_result_{timestamp_str}.txt")
-    results = {"file_results": {}, "probe_results": {}}
-    
-    threading.Thread(
+
+    t = threading.Thread(
         target=process_files,
         args=(
             selected_files, probes, threshold, sampling_percentage,
             output_dir_path, selected_format, cached_sequences,
-            completed_files, total_files, summary_file_path, results,
+            completed_files, total_files, summary_path, results,
             analysis_cancelled, update_queue,
             use_custom_parallel, custom_parallel_value
         ),
         daemon=True
-    ).start()
+    )
+    t.start()
+    t.join()
 
-    logging.debug("🔄 Background analysis thread started.")
+    update_queue.put(("finished", True, f"Completed: processed {total_files} files."))
     
 def process_files(
     selected_files, probes, threshold, sampling_percentage,
@@ -652,9 +639,9 @@ def FASTA_detect_and_quantify_probe_batched(
         update_queue.put(("status_update", input_file, f"Matching sequences (0/{total_records:,})"))
 
         probe_counts = Counter({name: 0 for name in probe_names})
-        matched_reads = set()
+        matched_sequences = set()
         read_to_probes = {}
-        total_matched_reads = 0
+        total_matched_sequences = 0
 
         cpu_count = os.cpu_count() or 1
         num_workers = min(int(cpu_count * 0.75), 61)
@@ -662,15 +649,22 @@ def FASTA_detect_and_quantify_probe_batched(
         
         with open(output_file_path, 'w', encoding="utf-8") as result_file:
             result_file.write("Metric\tValue\n")
-            result_file.write(f"Total Selected Reads\t{total_records}\n")
-            result_file.write("Total Matched Reads\t0\n")
-            result_file.write("Probe Name\tProbe Sequence\tMatched Reads\tPercentage of Total Reads\n")
+            result_file.write(f"Total Selected Sequences\t{total_records}\n")
+            result_file.write("Total Matched Sequences\t0\n")
+            result_file.write("Probe Name\tProbe Sequence\tMatched Sequences\tPercentage of Total Sequences\n")
             for probe_name in probe_counts:
                 probe_seq = probe_dict.get(probe_name, "N/A")
                 result_file.write(f"{probe_name}\t{probe_seq}\t0\t0.00%\n")
             result_file.write("\n")
-            result_file.write("\nMatched Reads Information\n")
-            result_file.write("Read ID\tProbe Name\tScore Original\tScore Reverse Complement\tRead Sequence\n")
+            result_file.write("\nMatched Sequences Information\n")
+            result_file.write("Read ID\tProbe Name\tScore Original\tScore Reverse Complement\n")
+
+        fasta_path = os.path.join(
+            output_dir_path,
+            f"{os.path.splitext(os.path.basename(input_file))[0]}_matched_reads.fasta"
+        )
+        fasta_fh = None
+        written_reads = set()
 
         with open(output_file_path, 'a', encoding="utf-8") as result_file, \
              ProcessPoolExecutor(max_workers = num_workers, initializer=init_worker_all, initargs=(cached_sequences, safe_cores)) as executor:
@@ -699,10 +693,21 @@ def FASTA_detect_and_quantify_probe_batched(
                     for match in matches:
                         read_id, probe_name, score_orig, score_rc, read_seq = match
                         probe_counts[probe_name] += 1
-                        matched_reads.add(read_id)
+                        matched_sequences.add(read_id)
                         read_to_probes.setdefault(read_id, set()).add(probe_name)
-                        result_file.write(f"{read_id}\t{probe_name}\t{score_orig}\t{score_rc}\t{read_seq}\n")
-            
+                        result_file.write(f"{read_id}\t{probe_name}\t{score_orig}\t{score_rc}\n")
+
+                        if read_id not in written_reads:
+                            if fasta_fh is None:
+                                try:
+                                    fasta_fh = open(fasta_path, 'w', encoding="utf-8")
+                                except Exception as e:
+                                    logging.exception(f"Failed to open FASTA for writing: {fasta_path} — {e}")
+                                    fasta_fh = None
+                            if fasta_fh is not None:
+                                fasta_fh.write(f">{read_id}\n{read_seq}\n")
+                                written_reads.add(read_id)
+
                     update_queue.put(("progress_update", input_file, processed_so_far))
                     update_queue.put(("status_update", input_file, f"Matching sequences ({processed_so_far:,}/{total_records:,})"))
             
@@ -710,7 +715,19 @@ def FASTA_detect_and_quantify_probe_batched(
                     logging.exception(f"❌ Exception during FASTA batch processing: {e}")
                     update_queue.put(("status_update", input_file, f"❌ Batch error: {e}"))
                     
-            total_matched_reads = len(matched_reads)
+            total_matched_sequences = len(matched_sequences)
+            
+            if fasta_fh is not None:
+                try:
+                    fasta_fh.close()
+                except Exception:
+                    pass
+                if len(written_reads) == 0 and os.path.exists(fasta_path):
+                    try:
+                        os.remove(fasta_path)
+                        logging.debug(f"No matched reads — removed empty FASTA: {fasta_path}")
+                    except Exception as e:
+                        logging.warning(f"Failed to remove empty FASTA ({fasta_path}): {e}")
 
         with open(output_file_path, 'r', encoding="utf-8") as f:
             lines = f.readlines()
@@ -720,13 +737,13 @@ def FASTA_detect_and_quantify_probe_batched(
             while i < len(lines):
                 line = lines[i]
 
-                if line.startswith("Total Matched Reads"):
-                    f.write(f"Total Matched Reads\t{total_matched_reads}\n")
+                if line.startswith("Total Matched Sequences"):
+                    f.write(f"Total Matched Sequences\t{total_matched_sequences}\n")
 
                 elif line.startswith("Probe Name\t"):
                     f.write(line)
                     i += 1
-                    while i < len(lines) and not lines[i].startswith("Matched Reads Information"):
+                    while i < len(lines) and not lines[i].startswith("Matched Sequences Information"):
                         i += 1
 
                     for probe_name in probe_counts:
@@ -925,6 +942,13 @@ def FASTQ_detect_and_quantify_probe(
         num_workers = min(int(cpu_count * 0.75), 61)
         futures_queue = queue.Queue()
 
+        fasta_path = os.path.join(
+            output_dir_path,
+            f"{os.path.splitext(os.path.basename(input_file))[0]}_matched_reads.fasta"
+        )
+        fasta_fh = None
+        written_reads = set() 
+
         with open(output_file_path, 'w', encoding="utf-8") as result_file:
             result_file.write("Metric\tValue\n")
             result_file.write(f"Total Selected Reads\t{total_records}\n")
@@ -935,7 +959,7 @@ def FASTQ_detect_and_quantify_probe(
                 result_file.write(f"{probe_name}\t{probe_seq}\t0\t0.00%\n")
             result_file.write("\n")
             result_file.write("\nMatched Reads Information\n")
-            result_file.write("Read ID\tProbe Name\tScore Original\tScore Reverse Complement\tRead Sequence\n")
+            result_file.write("Read ID\tProbe Name\tScore Original\tScore Reverse Complement\n")
 
         with gzip.open(file_to_use, "rt") if file_to_use.endswith(".gz") else open(file_to_use, "rt") as handle, \
              open(output_file_path, 'a', encoding="utf-8") as result_file, \
@@ -973,8 +997,19 @@ def FASTQ_detect_and_quantify_probe(
                         probe_counts[probe_name] += 1
                         matched_reads.add(read_id)
                         read_to_probes.setdefault(read_id, set()).add(probe_name)
-                        result_file.write(f"{read_id}\t{probe_name}\t{score_orig}\t{score_rc}\t{read_seq}\n")
-            
+                        result_file.write(f"{read_id}\t{probe_name}\t{score_orig}\t{score_rc}\n")
+                        
+                        if read_id not in written_reads:
+                            if fasta_fh is None:
+                                try:
+                                    fasta_fh = open(fasta_path, "w", encoding="utf-8")
+                                except Exception as e:
+                                    logging.exception(f"Failed to open FASTA for writing: {fasta_path} — {e}")
+                                    fasta_fh = None
+                            if fasta_fh is not None:
+                                fasta_fh.write(f">{read_id}\n{read_seq}\n")
+                                written_reads.add(read_id)
+                        
                     if processed_so_far - last_progress_update >= 10000:
                         update_queue.put(("progress_update", input_file, processed_so_far))
                         update_queue.put(("status_update", input_file, f"Matching reads ({processed_so_far:,}/{total_records:,})"))
@@ -987,10 +1022,23 @@ def FASTQ_detect_and_quantify_probe(
                     logging.exception(f"❌ Exception during FASTQ batch processing: {e}")
                     update_queue.put(("status_update", input_file, f"❌ Batch error: {e}"))
 
+
             submit_thread.join()
             
             total_matched_reads = len(matched_reads)
-            
+
+        if fasta_fh is not None:
+            try:
+                fasta_fh.close()
+            except Exception:
+                pass
+            if len(written_reads) == 0 and os.path.exists(fasta_path):
+                try:
+                    os.remove(fasta_path)
+                    logging.debug(f"No matched reads — removed empty FASTA: {fasta_path}")
+                except Exception as e:
+                    logging.warning(f"Failed to remove empty FASTA ({fasta_path}): {e}")
+
         with open(output_file_path, 'r', encoding="utf-8") as f:
             lines = f.readlines()
 
@@ -1278,7 +1326,7 @@ class CustomProgressDialog(QDialog):
         self._updated_files = set()
         self._completion_shown = False
 
-        self.completed_label = QLabel("Completed: 0 / 0")
+        self.completed_label = QLabel(f"Completed: 0 / {self.total_count}")
         self.completed_label.setStyleSheet("font-size: 12px; color: #555;")
         self.completed_label.setAlignment(Qt.AlignLeft)
 
@@ -1490,9 +1538,6 @@ class CustomMessageBox(QDialog):
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFixedSize(300, 100)
         self.setStyleSheet("""
-            QDialog {
-                background-color: #ffffff;
-            }
             QLabel {
                 font-size: 14px;
                 color: black;
@@ -1542,9 +1587,6 @@ class CustomConfirmBox(QDialog):
         self.result = False
 
         self.setStyleSheet("""
-            QDialog {
-                background-color: #ffffff;
-            }
             QLabel {
                 font-size: 14px;
                 color: #2c3e50;
@@ -1684,71 +1726,133 @@ class SequenceMiningGUI(QMainWindow):
         self.file_paths.clear()
         self.selected_file_paths.clear()
         self.ui.inputPathLineEdit.clear()
+        
+    def _restore_after_analysis(self):
+        self.ui.startAnalysisButton.setEnabled(True)
+        self.ui.startAnalysisButton.setText("Start Analysis")
+
 
     def start_analysis(self):
-        if not self.selected_file_paths:
+        probe_text = self.ui.probeTextEdit.toPlainText().strip()
+        threshold_str = self.ui.threasholdtextEdit.text().strip()
+        percentage_str = self.ui.percentagetextEdit.text().strip()
+        output_dir = self.ui.outputPathLineEdit.text().strip()
+        use_parallel = self.ui.parallelProcessingCheckbox.isChecked()
+        parallel_workers = int(self.ui.parallelProcessing.value())
+        file_format = "fastq" if self.ui.radioButton.isChecked() else "fasta"
+    
+        selected_files = list(self.selected_file_paths.values())
+    
+        if not selected_files:
             QMessageBox.warning(self, "Warning", "No files selected!")
             return
     
-        probe_text = self.ui.probeTextEdit.toPlainText()
-        is_valid, invalid_bases = validate_probes_before_analysis(probe_text)
+        if not probe_text:
+            QMessageBox.warning(self, "Warning", "Please enter probe sequences.")
+            return
     
+        is_valid, invalid_bases = validate_probes_before_analysis(probe_text)
         if not is_valid:
             QMessageBox.warning(
                 self,
-                "Invalid Base or format Found",
-                f"The following invalid bases or formatting errors were found in probe sequences:\n"
+                "Invalid Base or Format Found",
+                "The following invalid bases or formatting errors were found in probe sequences:\n"
                 f"{', '.join(invalid_bases)}\n\n"
                 "Please correct them before continuing. Analysis will be aborted."
             )
             return
-
-        file_format = "fastq" if self.ui.radioButton.isChecked() else "fasta"
+    
+        if not threshold_str:
+            QMessageBox.warning(self, "Warning", "Threshold is required.")
+            return
+        try:
+            threshold = int(threshold_str)
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Threshold must be an integer.")
+            return
+    
+        if not percentage_str:
+            QMessageBox.warning(self, "Warning", "Sampling percentage is required.")
+            return
+        try:
+            sampling = float(percentage_str)
+            if not (0 <= sampling <= 100):
+                QMessageBox.warning(self, "Warning", "Sampling percentage must be within 0–100.")
+                return
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Sampling percentage must be numeric.")
+            return
+    
+        if not output_dir:
+            QMessageBox.warning(self, "Warning", "Please select an output directory.")
+            return
+        if not os.path.isdir(output_dir):
+            QMessageBox.warning(self, "Warning", f"Output directory does not exist: {output_dir}")
+            return
+    
+        if use_parallel and parallel_workers < 1:
+            QMessageBox.warning(self, "Warning", "When parallel processing is enabled, workers must be ≥ 1.")
+            return
+    
         self.analysis_cancelled["flag"] = False
-        
-        self.completed_files = {"count": 0}
-        self.total_files = len(self.selected_file_paths)
 
+        self.ui.startAnalysisButton.setEnabled(False)
+        self.ui.startAnalysisButton.setText("Processing...")
+
+        self.completed_files = {"count": 0}
+        self.total_files = len(selected_files)
+    
         self.progress_window = CustomProgressDialog(
             file_list=self.selected_file_paths.keys(),
             parent_gui=self,
             update_queue=self.update_queue,
             analysis_cancelled=self.analysis_cancelled
         )
-        
-        for file_path in self.selected_file_paths.values():
+        for file_path in selected_files:
             self.update_queue.put(("status_update", file_path, "Stand-by"))
-
         self.progress_window.setModal(False)
         self.progress_window.show()
+        self.progress_window.finished.connect(
+            lambda _=None: self._restore_after_analysis()
+        )
+        self.progress_window.destroyed.connect(
+            lambda _=None: self._restore_after_analysis()
+        )
 
         threading.Thread(
-            target=run_analysis,
+            target=run_analysis,   
             args=(
-                self.ui.probeTextEdit,
-                self.ui.threasholdtextEdit,
-                self.ui.percentagetextEdit,
-                self.ui.outputPathLineEdit,
-                self.ui.selectedFilesList,
-                self.selected_file_paths,
-                file_format,
+                probe_text,           
+                threshold,           
+                sampling,            
+                output_dir,           
+                selected_files,       
+                file_format,          
                 self.analysis_cancelled,
                 self.update_queue,
-                self.ui.parallelProcessingCheckbox.isChecked(),
-                self.ui.parallelProcessing.value()  
+                use_parallel,
+                parallel_workers
             ),
             daemon=True
         ).start()
             
 def file_3_GUI():
-    app = QApplication(sys.argv)
+    app = QApplication.instance()
+    created = False
+
+    if not app:
+        app = QApplication(sys.argv)
+        created = True
+
     gui = SequenceMiningGUI()
     gui.show()
 
-    def keep_alive():
-        pass
-    timer = QTimer()
-    timer.timeout.connect(keep_alive)
-    timer.start(1000)
+    if created:
+        def keep_alive():
+            pass
 
-    sys.exit(app.exec())
+        timer = QTimer()
+        timer.timeout.connect(keep_alive)
+        timer.start(1000)
+
+        sys.exit(app.exec())

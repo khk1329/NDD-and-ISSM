@@ -1,0 +1,1259 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1284</width>
+    <height>749</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>SRA to FASTQ Downloader</string>
+  </property>
+  <property name="toolButtonStyle">
+   <enum>Qt::ToolButtonStyle::ToolButtonIconOnly</enum>
+  </property>
+  <property name="animated">
+   <bool>true</bool>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <property name="sizePolicy">
+    <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+     <horstretch>0</horstretch>
+     <verstretch>0</verstretch>
+    </sizepolicy>
+   </property>
+   <property name="layoutDirection">
+    <enum>Qt::LayoutDirection::LeftToRight</enum>
+   </property>
+   <property name="styleSheet">
+    <string notr="true">QWidget{background-color: #F3F4F5; color: black;}
+     QPushButton {
+                background-color: #547296;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #40546C;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #40546C;
+            }
+QLabel{background-color: #F3F4F5}</string>
+   </property>
+   <widget class="QTreeWidget" name="treeSearchResults">
+    <property name="geometry">
+     <rect>
+      <x>10</x>
+      <y>140</y>
+      <width>1261</width>
+      <height>192</height>
+     </rect>
+    </property>
+    <property name="layoutDirection">
+     <enum>Qt::LayoutDirection::LeftToRight</enum>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">QTreeWidget{background-color: white;
+        border: 1px solid #ccc;
+        border-radius: 3px
+    }
+QHeaderView::section {
+    background-color: #2f3e51; 
+    color: #e0f0ff;                
+    padding: 3px;
+    border: 1px solid #1e2a38;   
+    font-weight: bold;
+}
+QScrollBar:vertical {
+        background: transparent;
+        width: 6px;
+        margin: 2px 0 2px 0;
+    }
+
+QScrollBar::handle:vertical {
+        background: #9E9E9E;
+        border-radius: 3px;
+        min-height: 20px;
+    }
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+        height: 0px;
+        background: none;
+    }
+
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+        background: none;
+    }
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 6px;
+    margin: 0 2px 0 2px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #9E9E9E;
+    border-radius: 3px;
+    min-width: 20px;
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0px;
+    background: none;
+}
+
+QScrollBar::add-page:horizontal,
+QScrollBar::sub-page:horizontal {
+    background: none;
+}
+
+QTreeWidget::item:selected {
+    background-color: #1663AE; 
+    color: white;
+}
+
+QTreeWidget::item:hover {
+    background-color: #EBF5FD; 
+    color: black;
+}
+
+QTreeWidget::item {
+    border-bottom: 1px dotted #d0d0d0; 
+}</string>
+    </property>
+    <property name="lineWidth">
+     <number>1</number>
+    </property>
+    <property name="rootIsDecorated">
+     <bool>false</bool>
+    </property>
+    <attribute name="headerMinimumSectionSize">
+     <number>1</number>
+    </attribute>
+    <attribute name="headerDefaultSectionSize">
+     <number>139</number>
+    </attribute>
+    <column>
+     <property name="text">
+      <string>Title</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Platform Model</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Total Bases</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Total Reads</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Organism</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Library Strategy</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Bioproject</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Biosample</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Run Accession</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+   </widget>
+   <widget class="QTreeWidget" name="treeDownloadList">
+    <property name="geometry">
+     <rect>
+      <x>10</x>
+      <y>420</y>
+      <width>1261</width>
+      <height>201</height>
+     </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">QTreeWidget{background-color: white;
+        border: 1px solid #ccc;
+        border-radius: 3px
+    }
+QHeaderView::section {
+    background-color: #2f3e51; 
+    color: #e0f0ff;                
+    padding: 3px;
+    border: 1px solid #1e2a38;   
+    font-weight: bold;
+}
+QScrollBar:vertical {
+        background: transparent;
+        width: 6px;
+        margin: 2px 0 2px 0;
+    }
+
+QScrollBar::handle:vertical {
+        background: #9E9E9E;
+        border-radius: 3px;
+        min-height: 20px;
+    }
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+        height: 0px;
+        background: none;
+    }
+
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+        background: none;
+    }
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 6px;
+    margin: 0 2px 0 2px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #9E9E9E;
+    border-radius: 3px;
+    min-width: 20px;
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0px;
+    background: none;
+}
+
+QScrollBar::add-page:horizontal,
+QScrollBar::sub-page:horizontal {
+    background: none;
+}
+
+QTreeWidget::item:selected {
+    background-color: #1663AE;
+    color: white;
+}
+
+QTreeWidget::item:hover {
+    background-color: #EBF5FD; 
+    color: black;
+}
+
+QTreeWidget::item {
+    border-bottom: 1px dotted #d0d0d0; 
+}</string>
+    </property>
+    <property name="frameShadow">
+     <enum>QFrame::Shadow::Sunken</enum>
+    </property>
+    <property name="alternatingRowColors">
+     <bool>true</bool>
+    </property>
+    <property name="selectionMode">
+     <enum>QAbstractItemView::SelectionMode::MultiSelection</enum>
+    </property>
+    <property name="indentation">
+     <number>20</number>
+    </property>
+    <property name="rootIsDecorated">
+     <bool>false</bool>
+    </property>
+    <attribute name="headerMinimumSectionSize">
+     <number>1</number>
+    </attribute>
+    <attribute name="headerDefaultSectionSize">
+     <number>139</number>
+    </attribute>
+    <attribute name="headerStretchLastSection">
+     <bool>false</bool>
+    </attribute>
+    <column>
+     <property name="text">
+      <string>Title</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Platform Model</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Total Bases</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Total Reads</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Organism</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Library Strategy</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Bioproject</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Biosample</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+    <column>
+     <property name="text">
+      <string>Run Accession</string>
+     </property>
+     <property name="textAlignment">
+      <set>AlignCenter</set>
+     </property>
+    </column>
+   </widget>
+   <widget class="QPushButton" name="buttonDownloadStart">
+    <property name="geometry">
+     <rect>
+      <x>550</x>
+      <y>700</y>
+      <width>181</width>
+      <height>41</height>
+     </rect>
+    </property>
+    <property name="cursor">
+     <cursorShape>PointingHandCursor</cursorShape>
+    </property>
+    <property name="styleSheet">
+     <string notr="true"> QPushButton {
+                background-color: #0D47A1;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #4183BC;
+                border-radius: 6px;
+            }</string>
+    </property>
+    <property name="text">
+     <string>Download Start</string>
+    </property>
+   </widget>
+   <widget class="QWidget" name="horizontalLayoutWidget_3">
+    <property name="geometry">
+     <rect>
+      <x>10</x>
+      <y>670</y>
+      <width>1261</width>
+      <height>26</height>
+     </rect>
+    </property>
+    <layout class="QHBoxLayout" name="horizontalLayout_4">
+     <property name="spacing">
+      <number>2</number>
+     </property>
+     <item>
+      <spacer name="horizontalSpacer_10">
+       <property name="orientation">
+        <enum>Qt::Orientation::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QLabel" name="labelFormat">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>90</width>
+         <height>0</height>
+        </size>
+       </property>
+       <property name="text">
+        <string>Select format:</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QComboBox" name="comboFormat">
+       <property name="cursor">
+        <cursorShape>PointingHandCursor</cursorShape>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QComboBox {
+    border: 1px solid #5a5a5a; 
+    border-radius: 1px;             /* 모서리 둥글게 */
+    padding: 2px;
+    background-color: white;      /* 배경색 */
+    color: black;                   /* 텍스트 색상 */
+}
+
+QComboBox QAbstractItemView {
+    background-color: white;           /* 드롭다운 배경 */
+    color: black;                      /* 항목 텍스트 색 */
+    selection-background-color: #448aff; /* 선택된 항목 배경 */
+    selection-color: white;             /* 선택된 항목 텍스트 */
+    border: 1px solid #555555;
+}</string>
+       </property>
+       <item>
+        <property name="text">
+         <string>FASTQ</string>
+        </property>
+       </item>
+       <item>
+        <property name="text">
+         <string>FASTA</string>
+        </property>
+       </item>
+      </widget>
+     </item>
+     <item>
+      <spacer name="horizontalSpacer_11">
+       <property name="orientation">
+        <enum>Qt::Orientation::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QWidget" name="horizontalLayoutWidget_6">
+    <property name="geometry">
+     <rect>
+      <x>10</x>
+      <y>630</y>
+      <width>1261</width>
+      <height>31</height>
+     </rect>
+    </property>
+    <layout class="QHBoxLayout" name="horizontalLayout_7">
+     <property name="spacing">
+      <number>15</number>
+     </property>
+     <item>
+      <spacer name="horizontalSpacer_3">
+       <property name="orientation">
+        <enum>Qt::Orientation::Horizontal</enum>
+       </property>
+       <property name="sizeType">
+        <enum>QSizePolicy::Policy::Expanding</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="buttonSelectDirectory">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>110</width>
+         <height>0</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>150</width>
+         <height>20</height>
+        </size>
+       </property>
+       <property name="cursor">
+        <cursorShape>PointingHandCursor</cursorShape>
+       </property>
+       <property name="text">
+        <string>Select Directory</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLineEdit" name="lineEditDirectory">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>400</width>
+         <height>0</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>500</width>
+         <height>20</height>
+        </size>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QLineEdit{background-color: white;}</string>
+       </property>
+       <property name="maxLength">
+        <number>1000</number>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="horizontalSpacer_7">
+       <property name="orientation">
+        <enum>Qt::Orientation::Horizontal</enum>
+       </property>
+       <property name="sizeType">
+        <enum>QSizePolicy::Policy::Expanding</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QWidget" name="horizontalLayoutWidget_7">
+    <property name="geometry">
+     <rect>
+      <x>10</x>
+      <y>340</y>
+      <width>1261</width>
+      <height>41</height>
+     </rect>
+    </property>
+    <layout class="QHBoxLayout" name="horizontalLayout_8">
+     <item>
+      <spacer name="horizontalSpacer_8">
+       <property name="orientation">
+        <enum>Qt::Orientation::Horizontal</enum>
+       </property>
+       <property name="sizeType">
+        <enum>QSizePolicy::Policy::Expanding</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="buttonMoveToDownload">
+       <property name="minimumSize">
+        <size>
+         <width>180</width>
+         <height>25</height>
+        </size>
+       </property>
+       <property name="cursor">
+        <cursorShape>PointingHandCursor</cursorShape>
+       </property>
+       <property name="text">
+        <string>Move to Download List</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="buttonRemoveToDownloadList">
+       <property name="minimumSize">
+        <size>
+         <width>180</width>
+         <height>25</height>
+        </size>
+       </property>
+       <property name="cursor">
+        <cursorShape>PointingHandCursor</cursorShape>
+       </property>
+       <property name="text">
+        <string>Remove to Download List</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="horizontalSpacer_9">
+       <property name="orientation">
+        <enum>Qt::Orientation::Horizontal</enum>
+       </property>
+       <property name="sizeType">
+        <enum>QSizePolicy::Policy::Expanding</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QWidget" name="horizontalLayoutWidget_8">
+    <property name="geometry">
+     <rect>
+      <x>10</x>
+      <y>110</y>
+      <width>281</width>
+      <height>31</height>
+     </rect>
+    </property>
+    <layout class="QHBoxLayout" name="horizontalLayout_9">
+     <item>
+      <widget class="QPushButton" name="buttonSelectAllinSearchList">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>80</width>
+         <height>20</height>
+        </size>
+       </property>
+       <property name="cursor">
+        <cursorShape>PointingHandCursor</cursorShape>
+       </property>
+       <property name="text">
+        <string>Select all</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="labelSearchCount">
+       <property name="text">
+        <string>Search List: 0 items     </string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QWidget" name="layoutWidget">
+    <property name="geometry">
+     <rect>
+      <x>10</x>
+      <y>390</y>
+      <width>271</width>
+      <height>31</height>
+     </rect>
+    </property>
+    <layout class="QHBoxLayout" name="horizontalLayout_11">
+     <item>
+      <widget class="QPushButton" name="buttonSelectAllinSearchList_2">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>80</width>
+         <height>20</height>
+        </size>
+       </property>
+       <property name="cursor">
+        <cursorShape>PointingHandCursor</cursorShape>
+       </property>
+       <property name="text">
+        <string>Select all</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="labelDownloadCount">
+       <property name="text">
+        <string>Download List: 0 items     </string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QLabel" name="IDLlogo">
+    <property name="geometry">
+     <rect>
+      <x>1210</x>
+      <y>10</y>
+      <width>61</width>
+      <height>51</height>
+     </rect>
+    </property>
+    <property name="layoutDirection">
+     <enum>Qt::LayoutDirection::LeftToRight</enum>
+    </property>
+    <property name="text">
+     <string/>
+    </property>
+    <property name="textFormat">
+     <enum>Qt::TextFormat::PlainText</enum>
+    </property>
+    <property name="pixmap">
+     <pixmap resource="resource.qrc">:/icons/icons/IDL_mark.PNG</pixmap>
+    </property>
+    <property name="scaledContents">
+     <bool>true</bool>
+    </property>
+   </widget>
+   <widget class="QComboBox" name="filteringComboBox">
+    <property name="geometry">
+     <rect>
+      <x>930</x>
+      <y>110</y>
+      <width>341</width>
+      <height>24</height>
+     </rect>
+    </property>
+    <property name="cursor">
+     <cursorShape>PointingHandCursor</cursorShape>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">QComboBox {
+    border: 1px solid #5a5a5a; 
+    border-radius: 1px;            
+    padding: 2px;
+    background-color: white;     
+    color: black;                   
+}
+
+QComboBox QAbstractItemView {
+    background-color: white;          
+    color: black;                     
+    selection-background-color: #01579B;
+    selection-color: white;             
+    border: 1px solid #555555;
+}
+
+QComboBox QAbstractItemView::item:hover {
+    border-color: #1663AE;
+    background-color: #EBF5FD; 
+    color: black;}
+
+
+QScrollBar:vertical {
+        background: transparent;
+        width: 6px;
+        margin: 2px 0 2px 0;
+    }
+
+QScrollBar::handle:vertical {
+        background: #9E9E9E;
+        border-radius: 3px;
+        min-height: 20px;
+    }
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+        height: 0px;
+        background: none;
+    }
+
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+        background: none;
+    }
+
+</string>
+    </property>
+   </widget>
+   <widget class="QLabel" name="Filteringlabel">
+    <property name="geometry">
+     <rect>
+      <x>930</x>
+      <y>90</y>
+      <width>341</width>
+      <height>20</height>
+     </rect>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">QLabel{      background-color: #547296;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #40546C;
+                border-radius: 1px;
+           }</string>
+    </property>
+    <property name="text">
+     <string>Filtering on Organism</string>
+    </property>
+    <property name="alignment">
+     <set>Qt::AlignmentFlag::AlignCenter</set>
+    </property>
+   </widget>
+   <widget class="QPushButton" name="resetpushButton">
+    <property name="geometry">
+     <rect>
+      <x>880</x>
+      <y>110</y>
+      <width>41</width>
+      <height>21</height>
+     </rect>
+    </property>
+    <property name="cursor">
+     <cursorShape>PointingHandCursor</cursorShape>
+    </property>
+    <property name="styleSheet">
+     <string notr="true">     QPushButton {
+                background-color: #9E9E9E;
+                color: white;
+                font-weight: bold;
+                border: 1px solid black;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #616161;
+            }</string>
+    </property>
+    <property name="text">
+     <string>Reset</string>
+    </property>
+   </widget>
+   <widget class="QWidget" name="horizontalLayoutWidget_2">
+    <property name="geometry">
+     <rect>
+      <x>10</x>
+      <y>10</y>
+      <width>151</width>
+      <height>26</height>
+     </rect>
+    </property>
+    <layout class="QHBoxLayout" name="horizontalLayout_3">
+     <property name="spacing">
+      <number>0</number>
+     </property>
+     <item>
+      <widget class="QLabel" name="labelDatabase">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>90</width>
+         <height>0</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>90</width>
+         <height>16777215</height>
+        </size>
+       </property>
+       <property name="text">
+        <string>Select Database:</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QComboBox" name="comboDatabase">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="cursor">
+        <cursorShape>PointingHandCursor</cursorShape>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QComboBox {
+    border: 1px solid #5a5a5a; 
+    border-radius: 1px;             /* 모서리 둥글게 */
+    padding: 2px;
+    background-color: white;      /* 배경색 */
+    color: black;                   /* 텍스트 색상 */
+}
+
+QComboBox QAbstractItemView {
+    background-color: white;           /* 드롭다운 배경 */
+    color: black;                      /* 항목 텍스트 색 */
+    selection-background-color: #448aff; /* 선택된 항목 배경 */
+    selection-color: white;             /* 선택된 항목 텍스트 */
+    border: 1px solid #555555;
+}</string>
+       </property>
+       <item>
+        <property name="text">
+         <string>SRA</string>
+        </property>
+       </item>
+       <item>
+        <property name="text">
+         <string>ENA</string>
+        </property>
+       </item>
+      </widget>
+     </item>
+    </layout>
+   </widget>
+   <widget class="QWidget" name="formLayoutWidget_2">
+    <property name="geometry">
+     <rect>
+      <x>440</x>
+      <y>10</y>
+      <width>391</width>
+      <height>124</height>
+     </rect>
+    </property>
+    <layout class="QFormLayout" name="formLayout">
+     <property name="fieldGrowthPolicy">
+      <enum>QFormLayout::FieldGrowthPolicy::FieldsStayAtSizeHint</enum>
+     </property>
+     <property name="rowWrapPolicy">
+      <enum>QFormLayout::RowWrapPolicy::WrapLongRows</enum>
+     </property>
+     <item row="0" column="0">
+      <widget class="QLineEdit" name="lineEditEmail_2">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>300</width>
+         <height>0</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>255</width>
+         <height>20</height>
+        </size>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QLineEdit{background-color: white;}</string>
+       </property>
+       <property name="text">
+        <string>your Email for NCBI</string>
+       </property>
+      </widget>
+     </item>
+     <item row="0" column="1">
+      <widget class="QPushButton" name="buttonSaveEmail_2">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>85</width>
+         <height>20</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>80</width>
+         <height>16777215</height>
+        </size>
+       </property>
+       <property name="cursor">
+        <cursorShape>PointingHandCursor</cursorShape>
+       </property>
+       <property name="text">
+        <string> Save Email </string>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="0">
+      <widget class="QLineEdit" name="lineEditQuery">
+       <property name="enabled">
+        <bool>true</bool>
+       </property>
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="MinimumExpanding" vsizetype="Preferred">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>300</width>
+         <height>0</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>300</width>
+         <height>20</height>
+        </size>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QLineEdit{background-color: white;}</string>
+       </property>
+       <property name="text">
+        <string>Search Query</string>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="1">
+      <widget class="QPushButton" name="buttonSearch">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>85</width>
+         <height>20</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>80</width>
+         <height>16777215</height>
+        </size>
+       </property>
+       <property name="cursor">
+        <cursorShape>PointingHandCursor</cursorShape>
+       </property>
+       <property name="text">
+        <string>Search</string>
+       </property>
+      </widget>
+     </item>
+     <item row="3" column="1">
+      <widget class="QPushButton" name="buttonLoadMore">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>85</width>
+         <height>20</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>85</width>
+         <height>16777215</height>
+        </size>
+       </property>
+       <property name="cursor">
+        <cursorShape>PointingHandCursor</cursorShape>
+       </property>
+       <property name="text">
+        <string>Load More</string>
+       </property>
+      </widget>
+     </item>
+     <item row="2" column="1">
+      <widget class="QPushButton" name="SearchClearbutton">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="MinimumExpanding" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>85</width>
+         <height>20</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>85</width>
+         <height>16777215</height>
+        </size>
+       </property>
+       <property name="cursor">
+        <cursorShape>PointingHandCursor</cursorShape>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">     QPushButton {
+                background-color: #9E9E9E;
+                color: white;
+                font-weight: bold;
+                border: 1px solid black;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #616161;
+            }</string>
+       </property>
+       <property name="text">
+        <string>Clear search</string>
+       </property>
+      </widget>
+     </item>
+     <item row="3" column="0">
+      <widget class="QProgressBar" name="progressSearch">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Maximum" vsizetype="Minimum">
+         <horstretch>1</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>300</width>
+         <height>20</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>1300</width>
+         <height>15</height>
+        </size>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QProgressBar {
+    border: 1px solid #00CC66;
+    border-radius: 0px;
+    background-color: #E9F0F4;
+    text-align: center;
+    font: bold 12px;
+    color: #006400; /* 텍스트: 진한 초록 (DarkGreen) */
+}
+
+QProgressBar::chunk {
+    background: qlineargradient(
+        x1: 0, y1: 0, x2: 1, y2: 0,
+        stop: 0 #00FF7F,
+        stop: 1 #00CC66
+    );
+    border-radius: 0px;
+    margin: 0px;
+}</string>
+       </property>
+       <property name="maximum">
+        <number>100</number>
+       </property>
+       <property name="value">
+        <number>0</number>
+       </property>
+       <property name="textVisible">
+        <bool>false</bool>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </widget>
+  </widget>
+ </widget>
+ <tabstops>
+  <tabstop>comboDatabase</tabstop>
+  <tabstop>treeSearchResults</tabstop>
+  <tabstop>treeDownloadList</tabstop>
+  <tabstop>buttonRemoveToDownloadList</tabstop>
+  <tabstop>buttonSelectDirectory</tabstop>
+  <tabstop>lineEditDirectory</tabstop>
+  <tabstop>comboFormat</tabstop>
+  <tabstop>buttonDownloadStart</tabstop>
+ </tabstops>
+ <resources>
+  <include location="resource.qrc"/>
+ </resources>
+ <connections/>
+</ui>

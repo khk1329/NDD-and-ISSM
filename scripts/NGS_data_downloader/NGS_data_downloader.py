@@ -1,47 +1,41 @@
 import os
 import requests
-import tarfile
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, Label, Toplevel
 from Bio import Entrez
 import subprocess
 import threading
 from datetime import datetime
 import time
 import csv
-from bs4 import BeautifulSoup
-import zipfile
 import json
 import shutil
 import sys
+import stat
 import tempfile 
 import gzip
-import traceback
 from concurrent.futures import ThreadPoolExecutor
 import re
-from urllib.parse import quote
-from ftplib import FTP
-from PIL import Image, ImageTk
-import winreg
 import ctypes
-import psutil
-import logging
+from urllib.parse import quote_plus
+from collections import Counter
+from PySide6.QtWidgets import (
+    QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QTreeWidgetItem, QDockWidget, QListWidget, QListWidgetItem, QVBoxLayout, QWidget, QLineEdit, QSplitter,
+    QMessageBox, QProgressBar, QFileDialog, QTreeWidget, QDialog, QApplication, QMainWindow, QAbstractItemView, QSizePolicy, QHeaderView
+)
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
+from PySide6.QtGui import QCursor
+from functools import partial
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from ui.NGS_downloader import Ui_MainWindow
+from queue import Queue, Empty
 
 def get_resource_path(relative_path):
     if getattr(sys, 'frozen', False):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
 
-accession_tree = None
-download_list_tree = None
 stop_flag = False
-
-search_state = {
-    'query': '',
-    'retmax': 50,
-    'retstart': 0,
-    'total': 0
-}
 
 prefetch_retry_count = 3
 
@@ -52,8 +46,6 @@ completed_items = []
 failed_files = []
 active_threads = []
 log_lock = threading.Lock()  
-
-global start_button  
 
 def is_url_valid(url):
     try:
@@ -67,795 +59,1534 @@ def is_admin():
         return ctypes.windll.shell32.IsUserAnAdmin() != 0  
     except AttributeError:
         return False  
-
-def set_sratoolkit_env(toolkit_path):
-    try:
-        os.environ["PATH"] += os.pathsep + toolkit_path
-
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_ALL_ACCESS) as reg_key:
-            try:
-                current_path, _ = winreg.QueryValueEx(reg_key, "PATH")
-                current_paths = set(current_path.split(";"))  
-            except FileNotFoundError:
-                current_paths = set()
-
-            if toolkit_path not in current_paths:
-                current_paths.add(toolkit_path) 
-                new_path = ";".join(current_paths)  
-                winreg.SetValueEx(reg_key, "PATH", 0, winreg.REG_EXPAND_SZ, new_path)
-                print("✅ Updating User PATH completed")
-            else:
-                print("⚠️ The path is already registered in the user environment variables.")
-
-        subprocess.run("taskkill /f /im explorer.exe", shell=True)
-        subprocess.run("start explorer.exe", shell=True)
-
-        print(f"✅ Environment variable successfully applied. (User + System): {toolkit_path}")
-
-    except Exception as e:
-        print(f"❌  Failed to set environment variable : {e}")
-
-def check_and_install_sratoolkit(top):
-    def check_sratoolkit_installed():
-        try:
-            subprocess.run(["prefetch", "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            print("✅ SRA Toolkit successfully detected.")
-            return True
-        except FileNotFoundError:
-            print("❌ 'prefetch' command not found! The environment variable may not be applied.")
-            return False
-        except subprocess.CalledProcessError as e:
-            print(f"❌  An error occurred while running the SRA Toolkit: {e}")
-            return False
-
-    def install_sratoolkit():
-        try:
-            install_progress_label.config(text="Downloading SRA Toolkit...")
-            top.update_idletasks()
-
-            download_url = "https://ftp.ncbi.nlm.nih.gov/sra/sdk/3.1.1/sratoolkit.3.1.1-win64.zip"
-            download_path = os.path.join(os.getcwd(), "sratoolkit.zip")
-
-            with requests.get(download_url, stream=True) as response:
-                response.raise_for_status()
-                with open(download_path, "wb") as file:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        file.write(chunk)
-
-            install_progress_label.config(text="Extracting SRA Toolkit...")
-            top.update_idletasks()
-
-            with zipfile.ZipFile(download_path, "r") as zip_ref:
-                zip_ref.extractall(os.getcwd())
-
-            toolkit_dir = next((d for d in os.listdir() if d.startswith("sratoolkit")), None)
-            if toolkit_dir:
-                toolkit_path = os.path.abspath(os.path.join(toolkit_dir, "bin"))
-
-                set_sratoolkit_env(toolkit_path)
-
-                messagebox.showinfo("Success", f"SRA Toolkit installation completed and environment variable applied.:\n{toolkit_path}")
-
-                def close_install_window():
-                    completion_window.destroy()
-                    install_window.destroy()
-                    top.destroy()
-                    SRA_to_FASTQ_downloader_GUI()
-
-                completion_window = tk.Toplevel(install_window)
-                completion_window.title("Installation Complete")
-                completion_window.geometry("350x100")
-
-                tk.Label(completion_window, text="SRA Toolkit installation completed successfully.").pack(pady=15)
-                tk.Button(completion_window, text="Ok", command=close_install_window, cursor="hand2").pack(pady=5)
-
-                completion_window.update_idletasks()
-                width = completion_window.winfo_width()
-                height = completion_window.winfo_height()
-                x = (completion_window.winfo_screenwidth() // 2) - (width // 2)
-                y = (completion_window.winfo_screenheight() // 2) - (height // 2)
-                completion_window.geometry(f'{width}x{height}+{x}+{y}')
-            
-            else:
-                raise FileNotFoundError("Extracted toolkit directory not found.")
-
-        except requests.RequestException as e:
-            messagebox.showerror("Error", f"Download failed: {e}")
-        except Exception as e:
-            messagebox.showerror("Error", f"An unexpected error has occurred: {e}")
-
-    if not check_sratoolkit_installed():
-        install_window = tk.Toplevel(top)
-        install_window.title("SRA Toolkit Installation")
-        install_window.geometry("400x150")
-
-        install_progress_label = tk.Label(install_window, text="Checking SRA Toolkit...")
-        install_progress_label.pack(pady=20)
-
-        install_button = tk.Button(
-            install_window,
-            text="Install SRA Toolkit", cursor="hand2",
-            command=lambda: install_sratoolkit()
-        )
-        install_button.pack(pady=10)
-    else:
-        def close_info_window():
-            info_window.destroy()
-            top.destroy()
-            SRA_to_FASTQ_downloader_GUI()
-                    
-        info_window = tk.Toplevel(top)
-        info_window.title("Info")
-        info_window.geometry("350x100")
-
-        tk.Label(info_window, text="✅ SRA Toolkit is already installed and recognized.").pack(pady=15)
-        tk.Button(info_window, text="Ok", command=close_info_window, cursor="hand2").pack(pady=5)
-
-        info_window.update_idletasks()
-        width = info_window.winfo_width()
-        height = info_window.winfo_height()
-        x = (info_window.winfo_screenwidth() // 2) - (width // 2)
-        y = (info_window.winfo_screenheight() // 2) - (height // 2)
-        info_window.geometry(f'{width}x{height}+{x}+{y}')
-
+    
 def format_number(value):
     try:
         return "{:,}".format(int(value))
     except ValueError:
         return "N/A"
 
-def update_status(status_labels, index, message):
-    status_labels[index].config(text=message)
+class DownloadStatusWindow(QWidget):
+    def __init__(self, download_items, controller, output_dir, file_format, start_button=None, database="SRA", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Download Status")
+        self.setMinimumSize(800, 600)
 
-def notify_completion(top, message, status_window):
-    global start_button, log_file_name 
+        self.setStyleSheet("background-color: #F9FAFA;")
 
-    completion_window = tk.Toplevel(top)
-    completion_window.title("Download Completed")
-    completion_window.geometry("350x100")
-
-    tk.Label(completion_window, text=message).pack(pady=15)
-
-    def close_windows():
-        global log_file_name
-
-        completion_window.destroy()
-        status_window.destroy()
-
-        log_file_name = None
-        print("✅ log_file_name reset to None after completion.")
-
-        if 'start_button' in globals() and start_button and start_button.winfo_exists():
-            print("✅ Re-enabling Start button after completion.")
-            start_button.config(state="normal")
-        else:
-            print("⚠️ start_button is not available! Trying alternative method.")
-
-            for widget in top.winfo_children():
-                if isinstance(widget, tk.Button) and widget.cget("text") == "Download Start":
-                    print("✅ Found start_button! Re-enabling now.")
-                    widget.config(state="normal")
-                    break
-
-    tk.Button(completion_window, text="OK", command=close_windows, cursor="hand2").pack(pady=5)
-
-    completion_window.attributes("-topmost", True)
-
-    completion_window.update_idletasks()
-    width = completion_window.winfo_width()
-    height = completion_window.winfo_height()
-    x = (completion_window.winfo_screenwidth() // 2) - (width // 2)
-    y = (completion_window.winfo_screenheight() // 2) - (height // 2)
-    completion_window.geometry(f'{width}x{height}+{x}+{y}')
-
-def open_download_status_window(top, download_items, output_dir, download_list_tree, selected_format, selected_db, start_button):
-    global stop_flag, status_window
-    
-    if not download_items:
-        messagebox.showerror("Error", "No items to download!")
-        return
-    
-    if 'start_button' in globals() and start_button and start_button.winfo_exists():
-        top.after(0, lambda: start_button.config(state="normal"))
+        self.download_items = download_items
+        self.controller = controller
+        self.output_dir = output_dir
+        self.file_format = file_format
+        self.start_button = start_button
+        self.database = database
+        self._canceled = False
         
-    if 'status_window' in globals() and status_window.winfo_exists():
-        print("⚠️ Download window is already open! Skipping new instance.")
-        return
+        self.status_bars = {}
+        self.status_labels = {}
+        
+        self.progress_queue = Queue()
 
-    stop_flag = False  
+        layout = QVBoxLayout(self)
+        
+        self.completed_count = 0
+        self.failed_files = []      
+        self.total_count = len(self.download_items)
+        
+        self._updated_files = set()
+        self._completion_shown = False
+              
+        self.tree = QTreeWidget()
+        self.tree.headerItem().setTextAlignment(0, Qt.AlignCenter)
+        self.tree.headerItem().setTextAlignment(1, Qt.AlignCenter)
+        self.tree.headerItem().setTextAlignment(2, Qt.AlignCenter)
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["Run Accession", "Progress", "Status"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setSelectionMode(QTreeWidget.NoSelection)
+        self.tree.setFocusPolicy(Qt.NoFocus)
+        self.tree.setStyleSheet("""
+            QTreeWidget {
+                font-size: 12px;
+                color: #2c3e50;
+                background-color: white;
+                border: 1px solid #ccc;
+            }
+            QTreeWidget::item {
+                padding: 8px;
+                border-bottom: 1px dashed #ddd;
+            }
+            QHeaderView::section {
+                background-color: #f0f0f0;
+                color: #2c3e50;
+                padding: 6px;
+                font-weight: bold;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 6px;
+                margin: 2px 0 2px 0;
+            }
+        
+        QScrollBar::handle:vertical {
+                background: #9E9E9E;
+                border-radius: 3px;
+                min-height: 20px;
+            }
+        
+        QScrollBar::add-line:vertical,
+        QScrollBar::sub-line:vertical {
+                height: 0px;
+                background: none;
+            }
+        
+        QScrollBar::add-page:vertical,
+        QScrollBar::sub-page:vertical {
+                background: none;
+            }
+        """)
+        self.tree.header().setStretchLastSection(False)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.tree.header().resizeSection(0, 150)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.tree.header().resizeSection(1, 300)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.tree.header().resizeSection(2, 300)
 
-    status_window = tk.Toplevel(top)
-    status_window.title("Download Status")
-    status_window.geometry("700x400")
+        layout.addWidget(self.tree)
 
-    if start_button and start_button.winfo_exists():
-        print("✅ Disabling Start button...")
-        start_button["state"] = "disabled"
+        for acc, metadata in self.download_items:
+            item = QTreeWidgetItem(self.tree)
+            item.setText(0, acc)
+            item.setText(2, "Waiting...")
+            item.setTextAlignment(0, Qt.AlignCenter)
 
-    canvas = tk.Canvas(status_window)
-    scrollbar = ttk.Scrollbar(status_window, orient="vertical", command=canvas.yview)
-    scrollable_frame = ttk.Frame(canvas)
+            bar = QProgressBar()
+            bar.setValue(0)
+            bar.setMaximum(100)
+            bar.setFixedHeight(16)
+            bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            bar.setStyleSheet("""
+                QProgressBar {
+                    background-color: #E4E8EB;
+                    border: none;
+                    border-radius: 4px;
+                    text-align: center;
+                    font-size: 11px;
+                    color: white;
+                }
+                QProgressBar::chunk {
+                    background-color: #1D83D5;
+                    border-radius: 4px;
+                }
+            """)
+            self.tree.setItemWidget(item, 1, bar)
+            self.status_bars[acc] = bar
+            self.status_labels[acc] = item
 
-    scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-    canvas.configure(yscrollcommand=scrollbar.set)
+        bottom_layout = QHBoxLayout()
 
-    canvas.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
+        self.cancel_button = QPushButton("Cancel All")
+        self.cancel_button.setFixedWidth(100)
+        self.cancel_button.setCursor(Qt.PointingHandCursor)
+        self.cancel_button.clicked.connect(self.handle_close)
+        self.cancel_button.setStyleSheet("""
+            QPushButton {
+                background-color: #E53935;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #742220;
+                border-radius: 6px;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #742220;
+            }
+        """)
+        bottom_layout.addWidget(self.cancel_button, alignment=Qt.AlignLeft)
+        
+        bottom_layout.addStretch(1)
+        
+        self.completed_label = QLabel(f"Completed: 0 / {self.total_count}  ")
+        self.completed_label.setStyleSheet("font-size: 12px; color: #555;")
+        bottom_layout.addWidget(self.completed_label, alignment=Qt.AlignRight)
+        
+        layout.addLayout(bottom_layout)
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.process_progress_queue)
+        self.timer.start(200)
 
-    status_labels = []
-    progress_bars = []
+        self.start_downloads()
 
-    for i, run_acc in enumerate(download_items, start=0):
-        frame = tk.Frame(scrollable_frame)
-        frame.pack(fill="x", pady=5)
+    def process_progress_queue(self):
+        try:
+            while True:
+                data = self.progress_queue.get_nowait()
+                acc = data.get("acc")
+                status = data.get("status")
+                progress = data.get("progress")
 
-        tk.Label(frame, text=run_acc, width=15, anchor="w").pack(side="left", padx=2)
+                if acc in self.status_labels:
+                    self.status_labels[acc].setText(2, status)
+                if acc in self.status_bars:
+                    self.status_bars[acc].setValue(progress)
+        except Empty:
+            pass
 
-        progress = ttk.Progressbar(frame, mode="indeterminate", length=250)
-        progress.pack(side="left", padx=5)
-
-        status_label = tk.Label(frame, text="Waiting...", width=40, anchor="w", justify="left")
-        status_label.pack(side="left", padx=5, fill="x", expand=True)
-
-        status_labels.append(status_label)
-        progress_bars.append(progress)
-
-    def check_completion():
-        global completed_items, failed_files, stop_flag
+    def start_downloads(self):
+        self.max_concurrent = 4
+        self.pending_queue = []
+        self.active_workers = []
     
-        if stop_flag:
-            print("🚨 Download stopped. Exiting check_completion().")
-            return
+        for i, (acc, metadata) in enumerate(self.download_items):
     
-        total_completed = len(completed_items) + len(failed_files)
-        print(f"DEBUG: {total_completed}/{len(download_items)} downloads completed.")
-    
-        if total_completed >= len(download_items):
-            print("DEBUG: All downloads completed!")
-    
-            if failed_files:
-                message = f"Download completed with errors.\nFailed files: {', '.join(failed_files)}"
-                top.after(0, lambda: messagebox.showwarning("Warning", message))  
+            if self.database == "SRA":
+                worker = SraDownloadWorker(
+                    run_acc=acc,
+                    metadata=metadata,
+                    output_dir=self.output_dir,
+                    selected_format=self.file_format,
+                    progress_queue=self.progress_queue
+                )
             else:
-                top.after(0, lambda: notify_completion(top, "✅ All files downloaded successfully.", status_window))
+                worker = EnaDownloadWorker(
+                    run_acc=acc,
+                    metadata=metadata,
+                    output_dir=self.output_dir,
+                    progress_queue=self.progress_queue
+                )
     
-            completed_items.clear()
-            failed_files.clear()
-            active_threads.clear()
-            stop_flag = True  
+            worker.error.connect(lambda message, acc=acc: self.handle_worker_error(acc, message))
+            worker.done.connect(lambda acc=acc: self.mark_worker_finished(acc))
+            worker.done.connect(self.on_worker_done)
     
-            if start_button and start_button.winfo_exists():
-                top.after(0, lambda: start_button.config(state="normal"))
-        else:
-            print("DEBUG: Waiting for remaining downloads... Retrying in 15 seconds.")
-            top.after(10000, check_completion)
+            self.pending_queue.append(worker)
+    
+        self.start_next_batch()
 
-    def force_delete_file(file_path):
-        for proc in psutil.process_iter(['pid', 'name']):
-            try:
-                for file in proc.open_files():
-                    if file.path == file_path:
-                        print(f"⚠️ File {file_path} is in use by process {proc.info['name']} (PID: {proc.info['pid']}). Terminating process...")
-                        proc.terminate()
-                        proc.wait()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                print(f"🗑 Successfully deleted: {file_path}")
-            except Exception as e:
-                print(f"⚠️ Failed to delete {file_path}: {e}")
+    def start_next_batch(self):
+        while len(self.active_workers) < self.max_concurrent and self.pending_queue:
+            worker = self.pending_queue.pop(0)
+            self.active_workers.append(worker)
+            worker.start()
+
+    def on_worker_done(self):
+        self.active_workers = [w for w in self.active_workers if w.isRunning()]
+        self.start_next_batch()
+
+    def handle_worker_error(self, acc, message, *args):
+        self.failed_files.append(acc)
     
-    def on_close(start_button):
-        global completed_items, failed_files, active_threads, stop_flag, processes
+        if self.progress_queue:
+            self.progress_queue.put({
+                "acc": acc,
+                "status": message,
+                "progress": 0
+            })
     
-        confirm_close = messagebox.askyesno(
-            "Confirm Exit",
-            "Downloads are still in progress.\nDo you really want to stop and close the window?"
-        )
+        self.mark_worker_finished(acc)
+        self.on_worker_done()
+        
+    def mark_worker_finished(self, acc, *_):
+        self.completed_count += 1
+        self.completed_label.setText(f"Completed: {self.completed_count} / {self.total_count}  ")
     
-        if not confirm_close:
-            print("⏳ Download window close cancelled by user.")
-            return  
+        if self.completed_count == self.total_count and not self._completion_shown:
+            self._completion_shown = True
+            if self.start_button:
+                self.start_button.setEnabled(True)
     
-        print("🚨 Download window closed! Stopping active downloads and cleaning up...")
+            if self._canceled:
+                msg = "🛑 Download process was canceled."
+            elif self.failed_files:
+                failed_list = ", ".join(self.failed_files)
+                msg = f"❌ Some files failed to download:\n{failed_list}"
+            else:
+                msg = "✅ All files downloaded successfully."
     
-        stop_flag = True  
+            msg_box = CustomMessageBox(title="Download Summary", message=msg, parent=self)
+            msg_box.setWindowFlags(msg_box.windowFlags() | Qt.WindowStaysOnTopHint)
+            msg_box.exec()
     
-        for thread in active_threads:
-            if thread.is_alive():
-                print(f"⚠️ Stopping thread for {thread.name}")
-                thread.join(timeout=1)
-    
-        active_threads.clear()
-    
-        terminate_processes()
-    
-        if 'start_button' in globals() and start_button:
-            print("✅ Re-enabling Start button after download window closed.")
-            start_button.config(state="normal")
-        else:
-            print("⚠️ start_button is not available! Trying alternative method.")
+            self.force_close()
             
-            for widget in top.winfo_children():
-                if isinstance(widget, tk.Button) and widget.cget("text") == "Download Start":
-                    print("✅ Found start_button! Re-enabling now.")
-                    widget.config(state="normal")
-                    break
-    
-        status_window.update_idletasks()
-        status_window.destroy()
-    
-        print("✅ Download window closed successfully!")
-
-    def terminate_processes():
-        global processes
-        for process in processes:
-            if process.poll() is None:  
-                process.terminate()
-                print(f"🚨 Terminated process {process.pid}")
-        processes.clear()
-
-    status_window.protocol("WM_DELETE_WINDOW", lambda: on_close(start_button))
-
-    if selected_db == "SRA":
-        threading.Thread(
-            target=download_items_worker,
-            args=(download_items, output_dir, status_labels, progress_bars, top, status_window, selected_format)
-        ).start()
-    elif selected_db == "ENA":
-        for index, run_acc in enumerate(download_items):
-            threading.Thread(
-                target=download_and_convert_ena_fastq,
-                args=(run_acc, output_dir, status_labels, progress_bars, index, top, len(download_items), status_window)
-            ).start()
-
-    top.after(1000, check_completion)
-
-def download_items_worker(download_items, output_dir, status_labels, progress_bars, top, status_window, selected_format):
-    global completed_items, failed_files
-    prefetch_output_dir = r"C:\SRA_Virtual_Folder\prefetch_output"
-    os.makedirs(prefetch_output_dir, exist_ok=True)
-
-    total_items = len(download_items)
-
-    for index, run_acc in enumerate(download_items):
-        threading.Thread(
-            target=download_and_convert_sra_to_fastq,
-            args=(
-                run_acc, output_dir, status_labels, progress_bars, index,
-                top, total_items, status_window,
-                None, None, None, selected_format
-            )
-        ).start()
-       
-def update_accession_list_count(accession_tree, search_count_label):
-    count = len(accession_tree.get_children())
-    search_count_label.config(text=f"Search List: {count} items")
-
-def search_sra(top, search_box, email_box, accession_tree, search_button, search_progress, load_more_button):
-    query = search_box.get().strip()
-    if not query:
-        messagebox.showerror("Error", "Please enter a search query.")
-        return
-
-    disable_search_ui(search_button, search_progress)
-
-    global search_state
-    search_state['query'] = query
-    search_state['retstart'] = 0
-    search_state['total'] = 0
-
-    search_thread = threading.Thread(
-        target=search_and_display,
-        args=(
-            query,                
-            email_box,            
-            accession_tree,        
-            0,                    
-            50,                   
-            True,
-            search_button,
-            search_progress,
-            load_more_button       
+    def handle_close(self):
+        confirm = CustomConfirmBox(
+            title="Cancel Downloads",
+            message="Do you really want to cancel?",
+            on_close=self.mark_canceled,
+            parent=self
         )
-    )
-    search_thread.daemon = True
-    search_thread.start()
+        confirm.setWindowFlags(confirm.windowFlags() | Qt.WindowStaysOnTopHint)
+        confirm.exec()
 
-def search_ena(query, accession_tree, search_button, search_progress, load_more_button):
-    
-    def run_search():
-        global ena_search_results
-        ena_search_results = [] 
+    def mark_canceled(self):
+        self._canceled = True
         
-        try:
-            disable_search_ui(search_button, search_progress)
-            search_progress.start()
-
-            encoded_query = quote(query)
-            search_url = (
-                f"https://www.ebi.ac.uk/ena/portal/api/search?result=read_run"
-                f"&query=study_title%3D{encoded_query}"
-                "&fields=run_accession,study_accession,sample_accession,scientific_name,instrument_model,library_strategy"
-            )
-
-            print(f"DEBUG: ENA Search URL: {search_url}")
-
-            response = requests.get(search_url)
-            response.raise_for_status()
-
-            results = response.text.strip().split("\n")
-            print(f"DEBUG: ENA API Response (First 500 chars): {response.text[:500]}")
-
-            if len(results) > 1:
-                accession_tree.delete(*accession_tree.get_children())
-
-                for line in results[1:]:
-                    fields = line.split("\t")
-                    if len(fields) >= 6:
-                        metadata = {
-                            "Run Accession": fields[0],
-                            "Title": fields[3],  
-                            "Platform Model": fields[4],
-                            "Total Bases": "N/A",
-                            "Total Reads": "N/A",
-                            "Organism": fields[3],  
-                            "Library Strategy": fields[5],
-                            "Bioproject": fields[1],
-                            "Biosample": fields[2]
-                        }
-
-                        ena_search_results.append(metadata)
-
-                        accession_tree.insert("", "end", values=(
-                            fields[3], fields[4], "", "", fields[3], fields[5], fields[1], fields[2], fields[0]
-                        ))
-            else:
-                messagebox.showwarning("Warning", "No results found in ENA database.")
-
-        except requests.exceptions.RequestException as e:
-            messagebox.showerror("Error", f"ENA search failed: {e}")
-
-        finally:
-            search_progress.stop()
-            update_accession_list_count(accession_tree, search_count_label)
-            enable_search_ui(search_button, search_progress)
-
-    threading.Thread(target=run_search).start()
+        for worker in self.active_workers:
+            worker.stop()
+            
+            if self.progress_queue:
+                self.progress_queue.put({
+                    "acc": worker.run_acc,
+                    "status": "Canceling...",
+                    "progress": 0
+                })
+                
+        for worker in self.pending_queue:
+            if self.progress_queue:
+                self.progress_queue.put({
+                    "acc": worker.run_acc,
+                    "status": "Canceled (Not started)",
+                    "progress": 0
+                })
+            self.mark_worker_finished(worker.run_acc)
     
-def save_email_to_config(email):
-    config_path = os.path.join(os.getcwd(), "config.json")
-    try:
-        with open(config_path, "w") as config_file:
-            json.dump({"email": email}, config_file)
-    except Exception as e:
-        print(f"Failed to save email to config: {e}")
-
-def load_email_from_config():
-    config_path = os.path.join(os.getcwd(), "config.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r") as config_file:
-                data = json.load(config_file)
-                return data.get("email", "")
-        except Exception as e:
-            print(f"Failed to load email from config: {e}")
-    return ""    
-
-search_results = []  
-
-def is_valid_email(email):
-    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    return re.match(pattern, email)
-
-def set_email(email_box):
-    email = email_box.get()
-    if email:
-        Entrez.email = email
-        save_email_to_config(email)
-        messagebox.showinfo("Info", "Email saved successfully!")
-    else:
-        messagebox.showerror("Error", "Please enter a valid email.")
-
-def search_ngs_data(top, search_box, email_box, accession_tree, search_button, search_progress, load_more_button, database_combo, tree_frame):
-    query = search_box.get().strip()
-    database = database_combo.get() 
-
-    if not query:
-        messagebox.showerror("Error", "Please enter a search query.")
-        return
-
-    print(f"DEBUG: Searching in {database} with query: {query}")
-
-    retry_count = 5
-    while retry_count > 0:
-        if accession_tree and accession_tree.winfo_exists():
-            break
-        print(f"WARNING: accession_tree is not ready yet. Retrying... ({retry_count})")
-        time.sleep(0.1)
-        retry_count -= 1
-
-    if not accession_tree or not accession_tree.winfo_exists():
-        print("ERROR: accession_tree does not exist! Trying to find it in GUI...")
-
-        for widget in tree_frame.winfo_children():
-            if isinstance(widget, ttk.Treeview):
-                print("DEBUG: Found missing accession_tree. Reassigning...")
-                accession_tree = widget
-                break
-
-    if not accession_tree or not accession_tree.winfo_exists():
-        messagebox.showerror("Error", "Search list is not available. Please retry.")
-        print("ERROR: accession_tree does not exist! Aborting search.")
-        return
-
-    try:
-        accession_tree.delete(*accession_tree.get_children())
-        update_accession_list_count(accession_tree, search_count_label)
-    except Exception as e:
-        print(f"WARNING: Unable to clear accession_tree. Reason: {e}")
-
-    if database == "SRA":
-        search_sra(top, search_box, email_box, accession_tree, search_button, search_progress, load_more_button)
-    elif database == "ENA":
-        search_ena(query, accession_tree, search_button, search_progress, load_more_button)
-    else:
-        messagebox.showerror("Error", "Selected database is not supported.")    
+        self.pending_queue.clear()
+        
+    def force_close(self):
+        self._force_closing = True
+        self.close()
     
-is_searching = False  
-
-def clear_search_results(search_button, search_progress, accession_tree, load_more_button, search_box):
-    global is_searching, search_state, search_results
-
-    is_searching = False  
-    search_results.clear()  
-
-    enable_search_ui(search_button, search_progress)
-    search_progress.stop()  
-
-    try:
-        accession_tree.delete(*accession_tree.get_children()) 
-        update_accession_list_count(accession_tree, search_count_label)
-        print("DEBUG: Search results cleared successfully!")
-    except Exception as e:
-        print(f"WARNING: Failed to clear accession_tree. Error: {e}")
-
-    search_box.delete(0, tk.END)
-    print("DEBUG: Search entry cleared.")
-
-def search_and_display(query, email_box, accession_tree, retstart, retmax, is_new_search, search_button, search_progress, load_more_button):
-    global search_state, search_results, is_searching
-    is_searching = True
-
-    user_email = email_box.get().strip()
-    if not user_email:
-        messagebox.showerror("Error", "Please enter a valid email before searching.")
-        enable_search_ui(search_button, search_progress)
-        return
-
-    Entrez.email = user_email
-
-    try:
-        handle = Entrez.esearch(db="sra", term=query, retmax=retmax, retstart=retstart)
-        record = Entrez.read(handle)
-        handle.close()
-
-        search_state['total'] = int(record['Count'])
-        search_state['retstart'] += len(record['IdList'])
-
-        if is_new_search:
-            accession_tree.delete(*accession_tree.get_children())
-            search_results.clear()
-
-        ids = ",".join(record["IdList"])
-        summary_handle = Entrez.esummary(db="sra", id=ids, rettype="full")
-        summary_records = Entrez.read(summary_handle)
-        summary_handle.close()
-
-        results_batch = []
-
-        for summary_record in summary_records:
-            exp_xml = summary_record.get('ExpXml', '')
-            platform_model = re.search(r'instrument_model="(.*?)"', exp_xml)
-            total_bases = re.search(r'total_bases="(\d+)"', exp_xml)
-            total_spots = re.search(r'total_spots="(\d+)"', exp_xml)
-            experiment_name = re.search(r'<Title>(.*?)</Title>', exp_xml)
-            organism_name = re.search(r'ScientificName="(.*?)"', exp_xml)
-            library_strategy = re.search(r'<LIBRARY_STRATEGY>(.*?)</LIBRARY_STRATEGY>', exp_xml)
-            bioproject = re.search(r'<Bioproject>(.*?)</Bioproject>', exp_xml)
-            biosample = re.search(r'<Biosample>(.*?)</Biosample>', exp_xml)
-            runs_acc = re.search(r'acc="(.*?)"', summary_record.get('Runs', ''))
-
-            platform_model = platform_model.group(1) if platform_model else ''
-            total_bases = format_number(total_bases.group(1)) if total_bases else ''
-            total_reads = format_number(int(total_spots.group(1)) * 2) if total_spots and 'library_layout="PAIRED"' in exp_xml else format_number(int(total_spots.group(1))) if total_spots else ''
-            experiment_name = experiment_name.group(1) if experiment_name else ''
-            organism_name = organism_name.group(1) if organism_name else ''
-            library_strategy = library_strategy.group(1) if library_strategy else ''
-            bioproject = bioproject.group(1) if bioproject else ''
-            biosample = biosample.group(1) if biosample else ''
-            runs_acc = runs_acc.group(1) if runs_acc else ''
-
-            results_batch.append((
-                experiment_name, platform_model, total_bases, total_reads, organism_name,
-                library_strategy, bioproject, biosample, runs_acc
-            ))
-
-            search_results.append({
-                "Run Accession": runs_acc, "Title": experiment_name, "Platform Model": platform_model,
-                "Total Bases": total_bases, "Total Reads": total_reads, "Organism": organism_name,
-                "Library Strategy": library_strategy, "Bioproject": bioproject, "Biosample": biosample
+    def closeEvent(self, event):
+        if getattr(self, '_force_closing', False):
+            event.accept()
+        else:
+            self.handle_close()
+            event.ignore()
+                           
+class SraDownloadWorker(QThread):
+    progress = Signal(int)
+    status = Signal(str)
+    error = Signal(str)
+    done = Signal(str)
+    
+    def __init__(self, run_acc, metadata, output_dir, selected_format="FASTQ", progress_queue=None):
+        super().__init__()
+        self.run_acc = run_acc
+        self.metadata = metadata
+        self.output_dir = output_dir
+        self.selected_format = selected_format
+        self.progress_queue = progress_queue 
+        self.success = False
+        self._stopped = False 
+        self._output_created = False
+        self._created_out_dir = None
+        
+    def stop(self):
+        self._stopped = True
+        
+    def _put_progress(self, status, progress):
+        if self.progress_queue:
+            self.progress_queue.put({
+                "acc": self.run_acc,
+                "status": status,
+                "progress": progress
             })
 
-        for result in results_batch:
-            accession_tree.insert("", "end", values=result)
+    def cleanup_temp_files(self, temp_path, temp_sra_root, run_tmp):
+        if temp_path and os.path.exists(temp_path): shutil.rmtree(temp_path, ignore_errors=True)
+        if temp_sra_root and os.path.exists(temp_sra_root): shutil.rmtree(temp_sra_root, ignore_errors=True)
+        if run_tmp and os.path.exists(run_tmp): shutil.rmtree(run_tmp, ignore_errors=True)
 
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to search SRA database: {e}")
+    def _cleanup_out_dir_if_created(self):
+        if not self._output_created or not self._created_out_dir:
+            return
+        try:
+            if os.path.isdir(self._created_out_dir):
+                shutil.rmtree(self._created_out_dir, ignore_errors=True)
+        except Exception:
+            pass
+        finally:
+            self._output_created = False
+            self._created_out_dir = None
+
+    def run(self):
+        temp_path = None
+        temp_sra_root = None
+        run_tmp = None
+        
+        start_dt = datetime.now()
+        start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        end_dt = None
+        end_str = None
+        elapsed_str = None
+        
+        try:
+            if self._stopped:
+                self._put_progress("❌ Canceled", 0)
+                return
     
-    update_accession_list_count(accession_tree, search_count_label)
-    enable_search_ui(search_button, search_progress)
+            self._put_progress("Prefetching SRA...", 10)
+    
+            run_tmp = os.path.join("C:/tmp_ndd", self.run_acc)
+            try:
+                shutil.rmtree(run_tmp, ignore_errors=True)
+                os.makedirs(run_tmp, exist_ok=True)
+            except Exception as e:
+                self._put_progress(f"❌ Failed to prepare temp folder: {e}", 0)
+                self.error.emit(f"Temp folder creation failed for {self.run_acc}: {e}")
+                return
+    
+            try:
+                temp_path = tempfile.mkdtemp(prefix="tmp_", dir=run_tmp)
+            except Exception as e:
+                self._put_progress(f"❌ Failed to create temp path: {e}", 0)
+                self.error.emit(f"Temp path creation failed for {self.run_acc}: {e}")
+                return
+    
+            temp_sra_root = os.path.join("C:/NDD_dummy_file", self.run_acc)
+            os.makedirs(temp_sra_root, exist_ok=True)
+    
+            prefetch_worker = PrefetchWorker(
+                run_acc_list=[self.run_acc],
+                prefetch_output_dir=temp_sra_root,
+                max_workers=1
+            )
+            prefetch_worker.run()
+            
+            if self._stopped:
+                self._put_progress("❌ Canceled", 0)
+                return
+    
+            candidate_paths = [
+                os.path.join(temp_sra_root, self.run_acc, f"{self.run_acc}.sra"),
+                os.path.join(temp_sra_root, f"{self.run_acc}.sra")
+            ]
+            sra_path = next((p for p in candidate_paths if os.path.exists(p)), None)
 
-def load_more_results(accession_tree, search_button, search_progress, load_more_button, email_box, selected_db):
-    global search_state
+            if self._stopped:
+                self._put_progress("❌ Canceled", 0)
+                return
 
-    if search_state['retstart'] < search_state['total']:
-        disable_search_ui(search_button, search_progress)
-
-        if selected_db == "SRA":
-            threading.Thread(
-                target=search_and_display,
-                args=(
-                    search_state['query'],     
-                    email_box,                 
-                    accession_tree,             
-                    search_state['retstart'],   
-                    search_state['retmax'],     
-                    False,                     
-                    search_button,             
-                    search_progress,            
-                    load_more_button           
+            if not sra_path:
+                self._put_progress("❌ .sra file not found", 0)
+                self.error.emit(f".sra file not found for {self.run_acc}")
+                return
+    
+            self._put_progress("Downloading...", 50)
+    
+            out_dir = os.path.join(self.output_dir, self.run_acc)
+            os.makedirs(out_dir, exist_ok=True)
+            self._output_created = True
+            self._created_out_dir = out_dir
+    
+            if self.selected_format.upper() == "FASTA":
+                cmd = f'fastq-dump "{sra_path}" --outdir "{out_dir}" --split-files --fasta 0'
+                fallback_cmd = None
+            else:
+                cmd = f'fasterq-dump "{sra_path}" -O "{out_dir}" --split-files --temp "{temp_path}"'
+                fallback_cmd = f'fastq-dump "{sra_path}" -O "{out_dir}" --split-files --gzip'
+                
+            runner = ConversionRunner()
+            runner.log.connect(lambda msg: self.status.emit(msg))
+            
+            retry_limit = 3
+            for attempt in range(1, retry_limit + 1):
+                self.success = runner.run(cmd, fallback_cmd)
+                if self.success:
+                    break
+                else:
+                    self.status.emit(f"🔁 Retry {attempt} failed for {self.run_acc}")
+                    time.sleep(3)
+            
+            end_dt = datetime.now()
+            end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            elapsed_str = str(end_dt - start_dt).split(".")[0]
+            
+            if self._stopped:
+                self._put_progress("❌ Canceled", 0)
+                self._cleanup_out_dir_if_created()
+                return
+            
+            if not self.success:
+                self._put_progress("❌ Conversion failed", 0)
+                self.error.emit(f"Conversion failed for {self.run_acc}")
+                return
+    
+            if self.selected_format.upper() == "FASTQ" and "fasterq-dump" in cmd:
+                for fname in os.listdir(out_dir):
+                    
+                    if self._stopped:
+                        return
+                    
+                    if fname.endswith(".fastq"):
+                        try:
+                            src = os.path.join(out_dir, fname)
+                            dst = os.path.join(out_dir, fname + ".gz")
+                            with open(src, "rb") as f_in, gzip.open(dst, "wb") as f_out:
+                                shutil.copyfileobj(f_in, f_out)
+                            os.remove(src)
+                        except Exception as e:
+                            self.status.emit(f"Compression error: {e}")
+    
+            try:
+                log_metadata(
+                    run_acc=self.run_acc,
+                    output_dir=self.output_dir,
+                    metadata=self.metadata or {},
+                    elapsed_time=elapsed_str,
+                    start_time=start_str,
+                    end_time=end_str
                 )
-            ).start()
-    else:
-        messagebox.showinfo("Info", "No more results.")
+            except Exception as e:
+                print(f"[WARN] log_metadata failed for {self.run_acc}: {e}")
+    
+            if self._stopped:
+                self._put_progress("❌ Canceled", 0)
+                self._cleanup_out_dir_if_created()
+                return
 
-def on_load_more_clicked(tree_frame, search_button, search_progress, load_more_button, email_box, database_combo):
-    global accession_tree
+            self._put_progress("✅ Download Completed", 100)
+            self.progress.emit(1)
+    
+        except Exception as e:
+            self._put_progress(f"❌ Error: {e}", 0)
+            self._cleanup_out_dir_if_created()
+            self.error.emit(str(e))
+            
+        finally:
+            self.cleanup_temp_files(temp_path, temp_sra_root, run_tmp)
+            self.done.emit(self.run_acc)
+            
+class EnaDownloadWorker(QThread):
+    progress = Signal(int)
+    status = Signal(str)
+    error = Signal(str)
+    done = Signal(str)
+    
+    def __init__(self, run_acc, metadata, output_dir, progress_queue=None):
+        super().__init__()
+        self.run_acc = run_acc
+        self.metadata = metadata
+        self.output_dir = output_dir
+        self.progress_queue = progress_queue
+        self._stopped = False
+        self.success = False
+        self._emitted_done = False
+        self._output_created = False
+        self._created_dir = None 
 
-    for widget in tree_frame.winfo_children():
-        if isinstance(widget, ttk.Treeview):
-            accession_tree = widget
-            print("DEBUG: Found latest accession_tree for Load More.")
-            break
+    def stop(self):
+        self._stopped = True
+        
+    def _emit_done_once(self):
+        if not self._emitted_done:
+            self._emitted_done = True
+            self.done.emit(self.run_acc)
 
-    if not accession_tree or not accession_tree.winfo_exists():
-        messagebox.showerror("Error", "Search results are not available. Please retry.")
-        print("ERROR: accession_tree does not exist! Aborting load more.")
-        return
+    def _put_progress(self, status, progress):
+        if self.progress_queue:
+            self.progress_queue.put({
+                "acc": self.run_acc,
+                "status": status,
+                "progress": progress
+            })
 
-    selected_db = database_combo.get()
-    if selected_db == "SRA":
-        load_more_results(accession_tree, search_button, search_progress, load_more_button, email_box, selected_db)
-    else:
-        messagebox.showinfo("Info", "ENA does not support Load More functionality.")
+    def _cleanup_output_dir(self):
+        if not self._output_created or not self._created_dir:
+            return
+        try:
+            if os.path.isdir(self._created_dir):
+                def _onerror(func, path, exc_info):
+                    try:
+                        os.chmod(path, stat.S_IWRITE)
+                        func(path)
+                    except Exception:
+                        pass
+                for _ in range(2):
+                    try:
+                        shutil.rmtree(self._created_dir, onerror=_onerror)
+                        break
+                    except PermissionError:
+                        time.sleep(0.1)
+                    except FileNotFoundError:
+                        break
+        except Exception:
+            pass
+        finally:
+            self._output_created = False
+            self._created_dir = None
 
-    update_accession_list_count(accession_tree, search_count_label)
+    def run(self):
+        start_dt = datetime.now()
+        start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        end_dt = None
+        elapsed_str = None
 
-def disable_search_ui(search_button, search_progress):
-    search_button["state"] = "disabled"
-    search_progress.start()
+        final_output_dir = None
+        try:
+            if self._stopped:
+                self._put_progress("❌ Canceled", 0)
+                self._cleanup_output_dir()
+                return
 
-def enable_search_ui(search_button, search_progress):
-    search_button["state"] = "normal"
-    search_progress.stop()
+            self._put_progress("Fetching ENA file info...", 5)
 
-def select_directory(selected_directory_label):
-    output_dir = filedialog.askdirectory()
-    selected_directory_label.config(text=f"{output_dir}", bg="#F6F7F8")
+            api_url = (
+                f"https://www.ebi.ac.uk/ena/portal/api/filereport"
+                f"?accession={self.run_acc}&result=read_run&fields=fastq_ftp"
+            )
+            response = requests.get(api_url, timeout=60)
+            response.raise_for_status()
 
-def disable_download_ui(download_button, download_progress):
-    download_button["state"] = "disabled"
-    download_progress.start()
+            lines = response.text.strip().split("\n")
+            if len(lines) < 2:
+                raise FileNotFoundError(f"No FASTQ files found for {self.run_acc} in ENA.")
 
-def enable_download_ui(download_button, download_progress):
-    download_button["state"] = "normal"
-    download_progress.stop()
+            fastq_ftp_urls = lines[1].strip().split("\t", 1)[-1]
+            fastq_files = fastq_ftp_urls.split(";") if ";" in fastq_ftp_urls else [fastq_ftp_urls]
+            fastq_files = [u.strip() for u in fastq_files if u.strip()]
+
+            if not fastq_files:
+                raise FileNotFoundError(f"No FASTQ files found for {self.run_acc} in ENA.")
+
+            final_output_dir = os.path.abspath(os.path.join(self.output_dir, self.run_acc))
+            os.makedirs(final_output_dir, exist_ok=True)
+            self._output_created = True 
+            self._created_dir = final_output_dir
+
+            for file_url in fastq_files:
+                if self._stopped:
+                    self._put_progress("❌ Canceled", 0)
+                    self._cleanup_output_dir()
+                    return
+
+                https_url = f"https://{file_url}"
+                file_name = os.path.basename(file_url)
+                output_file_path = os.path.join(final_output_dir, file_name)
+
+                self._put_progress("Downloading...", 50)
+
+                success = False
+                for attempt in range(1, 4):
+                    try:
+                        with requests.get(https_url, stream=True, timeout=60) as r:
+                            r.raise_for_status()
+                            with open(output_file_path, "wb") as f:
+                                for chunk in r.iter_content(chunk_size=8192):
+                                    if self._stopped:
+                                        self._put_progress("❌ Canceled", 0)
+                                        self._cleanup_output_dir()
+                                        return
+                                    if chunk:
+                                        f.write(chunk)
+                        success = True
+                        break
+                    except Exception:
+                        if self._stopped:
+                            self._put_progress("❌ Canceled", 0)
+                            self._cleanup_output_dir()
+                            return
+                        self._put_progress(f"Retry {attempt} failed for {file_name}", 40)
+                        time.sleep(5)
+
+                if not success:
+                    self._put_progress("❌ Failed to download", 100)
+                    self.error.emit(f"Failed to download {file_name} after 3 attempts.")
+                    self._cleanup_output_dir()
+                    return
+
+            end_dt = datetime.now()
+            elapsed_str = str(end_dt - start_dt).split(".")[0]
+            total_size_mb = (
+                sum(os.path.getsize(os.path.join(final_output_dir, f)) for f in os.listdir(final_output_dir))
+                / (1024 * 1024)
+                if os.path.exists(final_output_dir) else 0
+            )
+
+            try:
+                log_metadata(
+                    run_acc=self.run_acc,
+                    output_dir=self.output_dir,
+                    metadata=self.metadata or {},
+                    elapsed_time=elapsed_str,
+                    start_time=start_str,
+                    end_time=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    total_size=total_size_mb
+                )
+            except Exception as e:
+                print(f"[WARN] log_metadata failed for {self.run_acc}: {e}")
+
+            if self._stopped:
+                self._put_progress("❌ Canceled", 0)
+                self._cleanup_output_dir()
+                return
+
+            self.success = True
+            self._put_progress("✅ Download Completed", 100)
+            self.progress.emit(1)
+
+        except Exception as e:
+            self._put_progress(f"❌ Error: {e}", 0)
+            self.error.emit(f"Exception for {self.run_acc}: {e}")
+            self._cleanup_output_dir()
+
+        finally:
+            self._emit_done_once()
+            
+class CustomMessageBox(QDialog):
+    def __init__(self, message, title="Notification", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.CustomizeWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFixedSize(320, 120)
+
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #F3F4F5; color: black;
+            }
+            QLabel {
+                font-size: 14px;
+                color: #2c3e50;
+                padding: 4px;
+            }
+            QPushButton {
+                background-color: #1D83D5;
+                color: white;
+                font-weight: bold;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 14px;
+                font-size: 12px; 
+            }
+            QPushButton:hover {
+                background-color: #306999;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 10)
+        layout.setSpacing(15)
+
+        label = QLabel(message)
+        label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(label)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        ok_button = QPushButton("Ok")
+        ok_button.setCursor(QCursor(Qt.PointingHandCursor))
+        ok_button.clicked.connect(self.accept)
+        button_layout.addWidget(ok_button)
+
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+    def showEvent(self, event):
+        self.raise_()
+        self.activateWindow()
+        self.setWindowState(self.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
+        QApplication.alert(self, 3000)
+        super().showEvent(event)
+
+    @staticmethod
+    def warning(parent=None, title="Warning", message="Warning occurred."):
+        dlg = CustomMessageBox(message, title, parent)
+        dlg.exec()
+
+    @staticmethod
+    def info(parent=None, title="Info", message="Information"):
+        dlg = CustomMessageBox(message, title, parent)
+        dlg.exec()
+
+    @staticmethod
+    def error(parent=None, title="Error", message="An error occurred."):
+        dlg = CustomMessageBox(message, title, parent)
+        dlg.exec()
+
+class CustomConfirmBox(QDialog):
+    def __init__(self, title, message, on_close=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setFixedSize(300, 100)
+        self.on_close = on_close
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.CustomizeWindowHint)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+
+        self.result = False
+
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #F3F4F5; color: black;
+            }
+            QLabel {
+                background-color: #F3F4F5;
+                font-size: 14px;
+                color: black;
+            }
+            QPushButton {
+                background-color: #1D83D5;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 14px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #1565C0;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        label = QLabel(message)
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(label)
+
+        button_layout = QHBoxLayout()
+        yes_btn = QPushButton("Yes")
+        no_btn = QPushButton("No")
+        yes_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        no_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+        yes_btn.clicked.connect(self.accept) 
+        no_btn.clicked.connect(self.reject)
+
+        button_layout.addStretch()
+        button_layout.addWidget(yes_btn)
+        button_layout.addWidget(no_btn)
+        button_layout.addStretch()
+
+        layout.addLayout(button_layout)
+
+    def accept(self):
+        if self.on_close:
+            self.on_close()
+        super().accept()
+
+class SraSearchWorker(QThread):
+    result_ready = Signal(list)
+    error_occurred = Signal(str)
+
+    def __init__(self, query, email, retmax=9999, retstart=0):
+        super().__init__()
+        self.query = query
+        self.email = email
+        self.retmax = retmax
+        self.retstart = retstart
+
+    def run(self):
+        try:
+            Entrez.email = self.email
+
+            handle = Entrez.esearch(db="sra", term=self.query, retmax=self.retmax, retstart=self.retstart)
+            record = Entrez.read(handle)
+            handle.close()
+
+            ids = ",".join(record["IdList"])
+            summary_handle = Entrez.esummary(db="sra", id=ids, rettype="full")
+            summary_records = Entrez.read(summary_handle)
+            summary_handle.close()
+
+            results = []
+
+            for summary_record in summary_records:
+                exp_xml = summary_record.get('ExpXml', '')
+                fields = {
+                    'Title': re.search(r'<Title>(.*?)</Title>', exp_xml),
+                    'Platform': re.search(r'instrument_model="(.*?)"', exp_xml),
+                    'Bases': re.search(r'total_bases="(\d+)"', exp_xml),
+                    'Spots': re.search(r'total_spots="(\d+)"', exp_xml),
+                    'Organism': re.search(r'ScientificName="(.*?)"', exp_xml),
+                    'Strategy': re.search(r'<LIBRARY_STRATEGY>(.*?)</LIBRARY_STRATEGY>', exp_xml),
+                    'Bioproject': re.search(r'<Bioproject>(.*?)</Bioproject>', exp_xml),
+                    'Biosample': re.search(r'<Biosample>(.*?)</Biosample>', exp_xml),
+                    'Run': re.search(r'acc="(.*?)"', summary_record.get('Runs', '')),
+                }
+
+                values = [
+                    fields['Title'].group(1) if fields['Title'] else "",
+                    fields['Platform'].group(1) if fields['Platform'] else "",
+                    f"{int(fields['Bases'].group(1)):,}" if fields['Bases'] else "",
+                    f"{int(fields['Spots'].group(1))*2:,}" if fields['Spots'] and 'library_layout="PAIRED"' in exp_xml else (f"{int(fields['Spots'].group(1)):,}" if fields['Spots'] else ""),
+                    fields['Organism'].group(1) if fields['Organism'] else "",
+                    fields['Strategy'].group(1) if fields['Strategy'] else "",
+                    fields['Bioproject'].group(1) if fields['Bioproject'] else "",
+                    fields['Biosample'].group(1) if fields['Biosample'] else "",
+                    fields['Run'].group(1) if fields['Run'] else ""
+                ]
+
+                results.append(values)
+
+            self.result_ready.emit(results)
+
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+class SearchHandler:
+    def __init__(self, ui):
+        self.ui = ui
+        self.retstart = 0
+        self.retmax = 9999
+        self.total = None
+        self.query = ""
+        self.email = ""
+
+    def start_search(self, reset=True):
+        if reset:
+            self.retstart = 0
+            self.query = self.ui.lineEditQuery.text()
+            self.email = self.ui.lineEditEmail_2.text()
+            self.ui.treeSearchResults.clear()
+        
+            setattr(self, "_accum_results", [])
+            if hasattr(self, "parent_app"):
+                self.parent_app.reset_organism_combo() 
+            
+        if not self.query:
+            CustomMessageBox.warning(None, "Warning", "Please enter a search query.")
+            return
+        if not self.email:
+            CustomMessageBox.warning(None, "Warning","Please enter your email address.")
+            return
+
+        self.ui.buttonSearch.setEnabled(False)
+        self.ui.progressSearch.setRange(0, 0) 
+
+        self.worker = SraSearchWorker(self.query, self.email, retmax=self.retmax, retstart=self.retstart)
+        self.worker.result_ready.connect(self.handle_results)
+        self.worker.error_occurred.connect(self.handle_error)
+        self.worker.start()
+
+    def handle_results(self, results):
+        self.ui.progressSearch.setRange(0, 1)
+        self.ui.buttonSearch.setEnabled(True)
+    
+        for row in results:
+            item_data = [
+                row[8],  
+                row[0],  
+                row[1],  
+                row[2],  
+                row[3], 
+                row[4],  
+                row[5], 
+                row[6],  
+                row[7],  
+            ]
+            item = QTreeWidgetItem()
+            for i, text in enumerate(item_data):
+                item.setText(i, text)
+                if i != 1: 
+                    item.setTextAlignment(i, Qt.AlignCenter)
+            self.ui.treeSearchResults.addTopLevelItem(item)
+    
+        count = self.ui.treeSearchResults.topLevelItemCount()
+        self.ui.labelSearchCount.setText(f"Search List: {count:,} items")
+        self.retstart += self.retmax
+        
+        results_for_org = []
+        for row in results:
+            run_acc = row[8] if len(row) > 8 else ""
+            meta = {
+                "organism": row[4] if len(row) > 4 else "",
+                "title": row[0] if len(row) > 0 else "",
+                "platform": row[1] if len(row) > 1 else "",
+                "bases": row[2] if len(row) > 2 else "",
+                "reads": row[3] if len(row) > 3 else "",
+                "strategy": row[5] if len(row) > 5 else "",
+                "bioproject": row[6] if len(row) > 6 else "",
+                "biosample": row[7] if len(row) > 7 else "",
+            }
+            results_for_org.append((run_acc, meta))
+        
+        acc = getattr(self, "_accum_results", [])
+        acc.extend(results_for_org)
+        self._accum_results = acc
+        
+        if hasattr(self, "parent_app"):
+            self.parent_app.update_organism_combo(self._accum_results)
+
+    def handle_error(self, err):
+        message = f"Search Failed:\n{err}"
+        CustomMessageBox.error(None, "Failed", message)
+        self.ui.progressSearch.setRange(0, 1)
+        self.ui.buttonSearch.setEnabled(True)
+
+    def load_more(self):
+        if self.retstart == 0:
+            CustomMessageBox.warning(None, "Warning", "No search started yet.")
+            return
+    
+        if hasattr(self, "parent_app"):
+            self.parent_app.clear_organism_filter_only()
+    
+        self.start_search(reset=False)
+
+
+class EnaSearchWorker(QThread):
+    result_ready = Signal(list)
+    error_occurred = Signal(str)
+
+    def __init__(self, query):
+        super().__init__()
+        self.query = query
+
+    def run(self):
+        try:
+            raw = (self.query or "").strip()
+            is_advanced = bool(re.search(r'\b(?:tax_eq|tax_tree|AND|OR|NOT|=)\b', raw, re.I))
+
+            if is_advanced:
+                query_expr = raw
+            else:
+                query_expr = f'study_title="{raw}"'
+
+            url = "https://www.ebi.ac.uk/ena/portal/api/search"
+            params = {
+                "result": "read_run",
+                "query": query_expr,
+                "fields": "run_accession,study_accession,sample_accession,scientific_name,instrument_model,library_strategy",
+                "format": "tsv",
+                "limit": "0"
+            }
+            headers = {"User-Agent": "NGS-Downloader/1.0"}
+
+            response = requests.get(url, params=params, headers=headers, timeout=30)
+            response.raise_for_status()
+
+            text = response.text.strip()
+            if not text:
+                self.result_ready.emit([])
+                return
+
+            lines = text.split("\n")
+            if len(lines) <= 1:
+                self.result_ready.emit([])
+                return
+
+            data_lines = lines[1:]
+            results = [line.split("\t") for line in data_lines]
+            self.result_ready.emit(results)
+
+        except requests.HTTPError as e:
+            msg = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
+            self.error_occurred.emit(msg)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+class EnaSearchHandler:
+    def __init__(self, ui):
+        self.ui = ui
+
+    def start_search(self):
+        
+        setattr(self, "_accum_results", [])
+        if hasattr(self, "parent_app"):
+            self.parent_app.clear_organism_filter_only()
+            
+        query = self.ui.lineEditQuery.text()
+        tree_widget = self.ui.treeSearchResults
+        progress_bar = self.ui.progressSearch
+        button = self.ui.buttonSearch
+
+        if not query:
+            CustomMessageBox.warning(None, "Warning", "Please enter a search query.")
+            return
+
+        button.setEnabled(False)
+        progress_bar.setRange(0, 0)
+
+        self.worker = EnaSearchWorker(query)
+        self.worker.result_ready.connect(lambda results: (
+            self.update_tree_with_results(tree_widget, results),
+            button.setEnabled(True),
+            progress_bar.setRange(0, 1),
+            self.ui.labelSearchCount.setText(f"Search List: {len(results):,} items")
+        ))
+        self.worker.error_occurred.connect(lambda err: (
+            CustomMessageBox.error(None, "Search Failed", str(err)),
+            button.setEnabled(True),
+            progress_bar.setRange(0, 1)
+        ))
+        self.worker.start()
+
+    def update_tree_with_results(self, tree_widget, results):
+        tree_widget.clear()
+        for row in results:
+            item = QTreeWidgetItem()
+            for i in range(len(row)):
+                item.setText(i, row[i])
+                if i != 3: 
+                    item.setTextAlignment(i, Qt.AlignCenter)
+            tree_widget.addTopLevelItem(item)
+            
+        results_for_org = []
+        for row in results:
+            run_acc = row[0] if len(row) > 0 else ""
+            meta = {
+                "organism": row[3] if len(row) > 3 else "",
+                "instrument_model": row[4] if len(row) > 4 else "",
+                "library_strategy": row[5] if len(row) > 5 else "",
+                "study_accession": row[1] if len(row) > 1 else "",
+                "sample_accession": row[2] if len(row) > 2 else "",
+            }
+            results_for_org.append((run_acc, meta))
+    
+        acc = getattr(self, "_accum_results", [])
+        acc.extend(results_for_org)
+        self._accum_results = acc
+        
+        if hasattr(self, "parent_app"):
+            self.parent_app.update_organism_combo(self._accum_results)
+
+class EmailConfigHandler:
+    def __init__(self, ui):
+        self.ui = ui
+        self.config_path = os.path.join(os.getcwd(), "config.json")
+        self.ui.buttonSaveEmail_2.clicked.connect(self.set_email_from_ui)
+        self.load_email_to_ui()
+
+    def is_valid_email(self, email):
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return re.match(pattern, email)
+
+    def save_email_to_config(self, email):
+        with open(self.config_path, "w") as config_file:
+            json.dump({"email": email}, config_file)
+
+    def load_email_from_config(self):
+        if os.path.exists(self.config_path):
+            with open(self.config_path, "r") as config_file:
+                data = json.load(config_file)
+                return data.get("email", "")
+        return ""
+
+    def set_email_from_ui(self):
+        email = self.ui.lineEditEmail_2.text().strip()
+        if self.is_valid_email(email):
+            Entrez.email = email
+            self.save_email_to_config(email)
+            CustomMessageBox.info(None, "Info", "Email saved successfully!")
+        else:
+            CustomMessageBox.error(None, "Error", "Please enter a valid email.")
+
+    def load_email_to_ui(self):
+        saved_email = self.load_email_from_config()
+        if saved_email:
+            self.ui.lineEditEmail_2.setText(saved_email)
+            Entrez.email = saved_email
+
+def apply_sra_column_styles(tree_widget):
+    widths = [140, 300, 180, 100, 100, 150, 150, 150, 150]
+    for i, width in enumerate(widths):
+        tree_widget.setColumnWidth(i, width)
+        tree_widget.headerItem().setTextAlignment(i, Qt.AlignCenter)
+    tree_widget.updateGeometry()
+    tree_widget.viewport().update()
+
+def apply_ena_column_styles(tree_widget):
+    widths = [180, 180, 180, 300, 180, 180]
+    for i, width in enumerate(widths):
+        tree_widget.setColumnWidth(i, width)
+        tree_widget.headerItem().setTextAlignment(i, Qt.AlignCenter)                
+    tree_widget.header().setStretchLastSection(True)
+    tree_widget.updateGeometry()
+    tree_widget.viewport().update()
+            
+class MainApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("NGS Data Downloader")
+        self.ui = Ui_MainWindow()
+        self.ui.setupUi(self)
+                
+        self.move(QApplication.primaryScreen().availableGeometry().center() - self.rect().center())
+        
+        self.ui.treeSearchResults.setColumnWidth(0, 140) 
+        self.ui.treeSearchResults.setColumnWidth(1, 300) 
+        self.ui.treeSearchResults.setColumnWidth(2, 180)  
+        self.ui.treeSearchResults.setColumnWidth(3, 100)  
+        self.ui.treeSearchResults.setColumnWidth(4, 100)  
+        self.ui.treeSearchResults.setColumnWidth(5, 150)  
+        self.ui.treeSearchResults.setColumnWidth(6, 150)  
+        self.ui.treeSearchResults.setColumnWidth(7, 150)  
+        self.ui.treeSearchResults.setColumnWidth(8, 150)  
+        
+        self.ui.treeDownloadList.setColumnWidth(0, 140)
+        self.ui.treeDownloadList.setColumnWidth(1, 300)
+        self.ui.treeDownloadList.setColumnWidth(2, 180)
+        self.ui.treeDownloadList.setColumnWidth(3, 100)
+        self.ui.treeDownloadList.setColumnWidth(4, 100)
+        self.ui.treeDownloadList.setColumnWidth(5, 150)
+        self.ui.treeDownloadList.setColumnWidth(6, 150)
+        self.ui.treeDownloadList.setColumnWidth(7, 150)
+        self.ui.treeDownloadList.setColumnWidth(8, 150)
+
+        self.email_handler = EmailConfigHandler(self.ui)
+        self.current_search_slot = None
+        self.current_search_handler = None
+        self.ena_search_handler = None
+
+        self.ui.treeSearchResults.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.ui.treeSearchResults.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.ui.treeDownloadList.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.ui.treeDownloadList.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._organism_filter_active = False
+
+        self.connect_signals()
+
+    def connect_signals(self):
+        self.ui.buttonSelectDirectory.clicked.connect(self.select_directory)
+        self.ui.buttonLoadMore.clicked.connect(lambda: self.current_search_handler.load_more() if self.current_search_handler else None)
+        self.ui.SearchClearbutton.clicked.connect(lambda: SearchUIUtils.clear_search_results(self.ui))
+        self.ui.filteringComboBox.currentIndexChanged.connect(self._apply_organism_combo_filter)
+        self.ui.SearchClearbutton.clicked.connect(self._reset_top_org)
+        self.ui.resetpushButton.clicked.connect(self.clear_organism_filter_only)
+        self.ui.lineEditQuery.returnPressed.connect(lambda: self.ui.buttonSearch.click())
+        self.ui.buttonDownloadStart.clicked.connect(self.start_download)
+        self.ui.buttonMoveToDownload.clicked.connect(self.move_to_download)
+        self.ui.buttonRemoveToDownloadList.clicked.connect(self.remove_from_download)
+        self.ui.buttonSelectAllinSearchList.clicked.connect(lambda: select_all_items(self.ui.treeSearchResults))
+        self.ui.buttonSelectAllinSearchList_2.clicked.connect(lambda: select_all_items(self.ui.treeDownloadList))
+        self.ui.comboDatabase.currentTextChanged.connect(
+            lambda _: on_database_change(
+                self.ui, self.ui.comboDatabase,
+                self.ui.buttonLoadMore, self.ui.treeSearchResults, self.ui.treeDownloadList, 
+                self
+            )
+        )
+        on_database_change(
+            self.ui,
+            self.ui.comboDatabase,
+            self.ui.buttonLoadMore,
+            self.ui.treeSearchResults,
+            self.ui.treeDownloadList,
+            self
+        )
+    def _reset_top_org(self):
+        self.reset_organism_combo()
+
+    def _apply_organism_combo_filter(self, _idx):
+        data = self.ui.filteringComboBox.currentData()
+        if not data:
+            return
+        self._organism_filter_active = True
+        org = data.get("organism") if isinstance(data, dict) else str(data)
+        handler = self.current_search_handler
+        results = getattr(handler, "_accum_results", []) if handler else []
+        if not results:
+            return
+        filtered = [(acc, meta) for acc, meta in results if (meta.get("organism") or "").strip() == org]
+        self.populate_search_results(filtered)
+
+    def populate_search_results(self, results):
+        tree = self.ui.treeSearchResults
+        tree.clear()
+
+        db = self.ui.comboDatabase.currentText().strip().upper()
+
+        if db == "SRA":
+            headers = [
+                "Run Accession", "Title", "Platform Model", "Total Bases",
+                "Total Reads", "Organism", "Library Strategy", "Bioproject", "Biosample"
+            ]
+            tree.setColumnCount(len(headers))
+            tree.setHeaderLabels(headers)
+            apply_sra_column_styles(tree)
+
+            for run_acc, meta in results:
+                cols = [
+                    run_acc,
+                    meta.get("title", ""),
+                    meta.get("platform", ""),
+                    meta.get("bases", ""),
+                    meta.get("reads", ""),
+                    meta.get("organism", ""),
+                    meta.get("strategy", ""),
+                    meta.get("bioproject", ""),
+                    meta.get("biosample", ""),
+                ]
+                item = QTreeWidgetItem()
+                for i, txt in enumerate(cols):
+                    item.setText(i, str(txt))
+                    if i != 1:
+                        item.setTextAlignment(i, Qt.AlignCenter)
+                tree.addTopLevelItem(item)
+
+        else: 
+            headers = [
+                "Run Accession", "Study Accession", "Sample Accession",
+                "Organism", "Instrument Model", "Library Strategy"
+            ]
+            tree.setColumnCount(len(headers))
+            tree.setHeaderLabels(headers)
+            apply_ena_column_styles(tree)
+
+            for run_acc, meta in results:
+                cols = [
+                    run_acc,
+                    meta.get("study_accession", ""),
+                    meta.get("sample_accession", ""),
+                    meta.get("organism", ""),
+                    meta.get("instrument_model", ""),
+                    meta.get("library_strategy", ""),
+                ]
+                item = QTreeWidgetItem()
+                for i, txt in enumerate(cols):
+                    item.setText(i, str(txt))
+                    if i != 3:  
+                        item.setTextAlignment(i, Qt.AlignCenter)
+                tree.addTopLevelItem(item)
+
+        self.ui.labelSearchCount.setText(f"Search List: {tree.topLevelItemCount():,} items")
+        tree.updateGeometry()
+        tree.viewport().update()
+
+    def update_organism_combo(self, results):
+        c = Counter()
+        for _, meta in (results or []):
+            org = (meta.get("organism") or "").strip()
+            if org:
+                c[org] += 1
+    
+        total = sum(c.values()) or 1
+        top = [(org, cnt, f"{(cnt/total)*100:.1f}%") for org, cnt in c.most_common(200)]
+    
+        cb = self.ui.filteringComboBox
+        prev = cb.currentText() if cb.count() else ""
+        cb.blockSignals(True)
+        try:
+            cb.clear()
+            for org, cnt, pct in top:
+                cb.addItem(f"{org} — {cnt:,} ({pct})", {"organism": org, "count": cnt, "percent": pct})
+            if prev and any(prev == cb.itemText(i) for i in range(cb.count())):
+                cb.setCurrentText(prev)
+            else:
+                cb.setCurrentIndex(-1)
+        finally:
+            cb.blockSignals(False)
+
+    def clear_organism_filter_only(self):
+        self._organism_filter_active = False
+        cb = self.ui.filteringComboBox
+        cb.blockSignals(True)
+        try:
+            cb.setCurrentIndex(-1)
+        finally:
+            cb.blockSignals(False)
+    
+        handler = self.current_search_handler
+        results = getattr(handler, "_accum_results", []) if handler else []
+        if results:
+            self.populate_search_results(results)
+    
+    def reset_organism_combo(self):
+        cb = self.ui.filteringComboBox
+        cb.blockSignals(True)
+        try:
+            cb.clear()
+        finally:
+            cb.blockSignals(False)
+
+    def select_directory(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        if dir_path:
+            self.ui.lineEditDirectory.setText(os.path.normpath(dir_path))
+
+    def prepare_download_data(self):
+        selected_items = [self.ui.treeDownloadList.topLevelItem(i) for i in range(self.ui.treeDownloadList.topLevelItemCount())]
+        if not selected_items:
+            return None, "Please add items to download list."
+        output_dir = self.ui.lineEditDirectory.text().strip()
+        if not output_dir:
+            return None, "Please select an output directory."
+        selected_format = self.ui.comboFormat.currentText()
+        download_data = []
+        for item in selected_items:
+            metadata = {
+                "Run Accession": item.text(0),
+                "Title": item.text(1),
+                "Platform": item.text(2),
+                "Bases": item.text(3),
+                "Reads": item.text(4),
+                "Organism": item.text(5),
+                "Strategy": item.text(6),
+                "Bioproject": item.text(7),
+                "Biosample": item.text(8)
+            }
+            run_acc = metadata["Run Accession"]
+            download_data.append((run_acc, metadata))
+        return {
+            "download_items": download_data,
+            "output_dir": output_dir,
+            "file_format": selected_format
+        }, None
+
+    def start_download(self):
+        data, error = self.prepare_download_data()
+        if error:
+            CustomMessageBox.error(None, "error", error)
+            return
+        
+        self.ui.buttonDownloadStart.setEnabled(False)
+        status_window = DownloadStatusWindow(
+            download_items=data["download_items"],
+            controller=self,
+            output_dir=data["output_dir"],
+            file_format=data["file_format"],
+            start_button=self.ui.buttonDownloadStart,
+            database=self.ui.comboDatabase.currentText()
+        )
+        status_window.show()
+
+    def move_to_download(self):
+        move_to_download_list(
+            self.ui.treeSearchResults,
+            self.ui.treeDownloadList,
+            self.ui.labelDownloadCount
+        )
+
+    def remove_from_download(self):
+        remove_from_download_list(
+            self.ui.treeDownloadList,
+            self.ui.labelDownloadCount
+        )
+
+class SearchUIUtils:
+    def clear_search_results(ui):
+        ui.treeSearchResults.clear()
+        ui.lineEditQuery.clear()
+        ui.progressSearch.setRange(0, 1)
+        ui.buttonSearch.setEnabled(True)
+        ui.labelSearchCount.setText("Search List: 0 items")
+
+class UIStateUtils:
+    @staticmethod
+    def disable_search_ui(ui):
+        ui.buttonSearch.setEnabled(False)
+        ui.progressSearch.setRange(0, 0)
+        
+    @staticmethod
+    def enable_search_ui(ui):
+        ui.buttonSearch.setEnabled(True)
+        ui.progressSearch.setRange(0, 1)
+
+    @staticmethod
+    def disable_download_ui(ui):
+        ui.buttonDownload.setEnabled(False)
+        ui.progressDownload.setRange(0, 0)
+
+    @staticmethod
+    def enable_download_ui(ui):
+        ui.buttonDownload.setEnabled(True)
+        ui.progressDownload.setRange(0, 1)
+
+    @staticmethod
+    def select_directory(ui):
+        directory = QFileDialog.getExistingDirectory()
+        if directory:
+            ui.labelSelectedDir.setText(directory)
+        return directory
 
 def run_command_with_retries(command, retries=3):
     for attempt in range(1, retries + 1):
         try:
-            print(f"Attempt {attempt}/{retries}: Running command: {command}")
-            subprocess.run(command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(command, shell=True, check=True)
             return True
-        except subprocess.CalledProcessError as e:
-            print(f"Attempt {attempt} failed: {e}")
+        except subprocess.CalledProcessError:
             if attempt == retries:
-                print(f"Command failed after {retries} attempts: {command}")
                 return False
-            time.sleep(5)  
+            time.sleep(5)
     return False
 
 def check_disk_space(directory, required_space_gb):
     try:
         total, used, free = shutil.disk_usage(directory)
         free_gb = free / (1024 ** 3)
-        print(f"Available: {free_gb:.2f} GB, Required: {required_space_gb:.2f} GB")
         return free_gb >= required_space_gb
-    except Exception as e:
-        print(f"Error checking disk space: {e}")
+    except Exception:
         return False
     
-def check_disk_space_periodically(directory, required_space_gb, interval=60):
-    global stop_flag
+class DiskMonitor(QThread):
+    warning = Signal(str)
 
-    while not stop_flag:
-        if not check_disk_space(directory, required_space_gb):
-            print("🚨 Disk space is running low! Stopping downloads.")
-            stop_flag = True  
-            return  
+    def __init__(self, directory, required_gb, interval=60):
+        super().__init__()
+        self.directory = directory
+        self.required_gb = required_gb
+        self.interval = interval
+        self._stop = False
 
-        for _ in range(interval):
-            if stop_flag:
-                print("⏹ Disk space check stopped.")
-                return
-            time.sleep(5) 
+    def run(self):
+        while not self._stop:
+            if not check_disk_space(self.directory, self.required_gb):
+                self.warning.emit("🚨 Disk space is too low. Downloads will be stopped.")
+                break
+
+            for _ in range(self.interval):
+                if self._stop:
+                    break
+                time.sleep(1)
+
+    def stop(self):
+        self._stop = True
         
 def calculate_total_required_space(run_acc_list, prefetch_output_dir):
     total_required_space_gb = 0
     for run_acc in run_acc_list:
         sra_file_path = os.path.join(prefetch_output_dir, run_acc, f"{run_acc}.sra")
         if not os.path.exists(sra_file_path):
-            print(f"File {sra_file_path} not found after prefetch.")
             continue
-        try:
-            sra_file_size_gb = os.path.getsize(sra_file_path) / (1024 ** 3)
-            estimated_space = sra_file_size_gb * 5  
-            total_required_space_gb += estimated_space
-            print(f"File size of {sra_file_path}: {sra_file_size_gb:.2f} GB (Estimated space: {estimated_space:.2f} GB)")
-        except Exception as e:
-            print(f"Error calculating size for {sra_file_path}: {e}")
+        sra_file_size_gb = os.path.getsize(sra_file_path) / (1024 ** 3)
+        estimated_space = sra_file_size_gb * 5  
+        total_required_space_gb += estimated_space
     return total_required_space_gb
 
-def prefetch_sra_files(run_acc_list, prefetch_output_dir):
-    os.makedirs(prefetch_output_dir, exist_ok=True)
+class PrefetchWorker(QThread):
+    finished = Signal()
+    failed = Signal(str)
+
+    def __init__(self, run_acc_list, prefetch_output_dir, max_workers=4):
+        super().__init__()
+        self.run_acc_list = run_acc_list
+        self.output_dir = prefetch_output_dir
+        self.max_workers = max_workers
+
+    def run(self):
+        os.makedirs(self.output_dir, exist_ok=True)
     
-    def prefetch_single(run_acc):
-        sra_file_path = os.path.join(prefetch_output_dir, run_acc, f"{run_acc}.sra")
-        if os.path.exists(sra_file_path):
-            print(f"{run_acc}.sra already exists. Skipping prefetch.")
-            return True
+        def prefetch_one(run_acc):
         
-        prefetch_cmd = f'prefetch "{run_acc}" --output-directory "{prefetch_output_dir}" --max-size 500G'
-        return run_command_with_retries(prefetch_cmd) 
-        print(f"Running prefetch: {prefetch_cmd}")
-        try:
-            subprocess.run(prefetch_cmd, shell=True, check=True)
+            sra_file_path = os.path.join(self.output_dir, run_acc, f"{run_acc}.sra")
+        
+            if os.path.exists(sra_file_path):
+                return True
+        
+            safe_output_dir = os.path.normpath(self.output_dir)
+            cmd = f'prefetch "{run_acc}" --output-directory "{safe_output_dir}" --max-size 500G'
+        
+            success = run_command_with_retries(cmd)
+        
+            if not success or not os.path.exists(sra_file_path):
+                return False
+        
             return True
-        except subprocess.CalledProcessError as e:
-            print(f"Error prefetching {run_acc}: {e}")
-            return False
-    
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(prefetch_single, run_acc) for run_acc in run_acc_list]
-        for future in futures:
-            if not future.result():
-                print("Prefetch failed for a run.")
+
+        failed_items = []
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(prefetch_one, run): run for run in self.run_acc_list}
+            for future in futures:
+                success = future.result()
+                if not success:
+                    failed_items.append(futures[future])
+
+        if failed_items:
+            self.failed.emit(", ".join(map(str, failed_items)))
+        else:
+            self.finished.emit()
             
-def check_total_disk_space_and_prefetch(top, run_acc_list, prefetch_output_dir):
-    global stop_flag
-    prefetch_sra_files(run_acc_list, prefetch_output_dir)
-    
-    if stop_flag:  
-        print("🚨 Download stopped by user. Skipping prefetch retries.")
-        return False
+def check_total_disk_space_and_prefetch(run_acc_list, prefetch_output_dir):
+    os.makedirs(prefetch_output_dir, exist_ok=True)
 
     total_required_space_gb = calculate_total_required_space(run_acc_list, prefetch_output_dir)
-    if not check_disk_space(prefetch_output_dir, total_required_space_gb):
-        raise RuntimeError(f"Not enough disk space. Required: {total_required_space_gb:.2f} GB")
 
     for run_acc in run_acc_list:
         sra_file_path = os.path.join(prefetch_output_dir, run_acc, f"{run_acc}.sra")
@@ -863,753 +1594,301 @@ def check_total_disk_space_and_prefetch(top, run_acc_list, prefetch_output_dir):
             sra_file_size_gb = os.path.getsize(sra_file_path) / (1024 ** 3)
             estimated_space = sra_file_size_gb * 5
             total_required_space_gb += estimated_space
+
+    if not check_disk_space(prefetch_output_dir, total_required_space_gb):
+        raise RuntimeError(f"Not enough disk space. Required: {total_required_space_gb:.2f} GB")
+
     return total_required_space_gb
 
-def run_conversion_command(primary_cmd, fallback_cmd=None, retries=2):
-    global stop_flag, processes
+class ConversionRunner(QObject):
+    finished = Signal(str)
+    log = Signal(str)
 
-    for attempt in range(1, retries + 1):
-        if stop_flag:  
-            print("🚨 Download stopped by user. Aborting conversion.")
-            return False
+    def __init__(self):
+        super().__init__()
+        self._stopped = False
 
-        print(f"Attempt {attempt}/{retries} for command: {primary_cmd}")
+    def stop(self):
+        self._stopped = True
 
-        try:
-            process = subprocess.Popen(primary_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            processes.append(process)  
-            stdout, stderr = process.communicate()
+    def run(self, primary_cmd, fallback_cmd=None, retries=2):
+        for attempt in range(1, retries + 1):
+            if self._stopped:
+                self.log.emit("⏹️ Conversion aborted by user.")
+                self.finished.emit(False)
+                return False  
 
-            if process.returncode == 0:
-                print(f"✅ Primary command succeeded: {primary_cmd}")
-                return True
-            else:
-                print(f"❌ Primary command failed on attempt {attempt}: {stderr.decode()}")
-
-        except Exception as e:
-            print(f"❌ Error running primary command on attempt {attempt}: {e}")
-
-        if attempt < retries:
-            print("⏳ Retrying primary command in 10 seconds...")
-            time.sleep(3)  
-
-    if fallback_cmd:
-        for fallback_attempt in range(1, retries + 1):
-            if stop_flag:  
-                print("🚨 Download stopped by user. Aborting conversion.")
-                return False
-
-            print(f"Attempt {fallback_attempt}/{retries} for fallback command: {fallback_cmd}")
-
+            self.log.emit(f"▶️ Attempt {attempt}/{retries} for: {primary_cmd}")
             try:
-                process = subprocess.Popen(fallback_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                processes.append(process) 
-                stdout, stderr = process.communicate()
-
-                if process.returncode == 0:
-                    print(f"✅ Fallback command succeeded: {fallback_cmd}")
-                    return True
+                proc = subprocess.Popen(primary_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout, stderr = proc.communicate()
+                if proc.returncode == 0:
+                    self.log.emit("✅ Conversion succeeded.")
+                    self.finished.emit(True)
+                    return True  
                 else:
-                    print(f"❌ Fallback command failed on attempt {fallback_attempt}: {stderr.decode()}")
-
+                    self.log.emit(f"❌ Failed: {stderr.decode().strip()}")
             except Exception as e:
-                print(f"❌ Error running fallback command on attempt {fallback_attempt}: {e}")
+                self.log.emit(f"❌ Exception: {str(e)}")
 
-            if fallback_attempt < retries:
-                print("⏳ Retrying fallback command in 10 seconds...")
-                time.sleep(3)
+            time.sleep(2)
 
-    print(f"❌ Both primary and fallback commands failed after {retries} attempts.")
-    return False
+        if fallback_cmd and not self._stopped:
+            self.log.emit(f"🔁 Trying fallback: {fallback_cmd}")
+            try:
+                proc = subprocess.Popen(fallback_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout, stderr = proc.communicate()
 
-def log_metadata(run_acc, output_dir, metadata, elapsed_time, total_size=None):
-    global log_file_name  
+                if proc.returncode == 0:
+                    self.log.emit("✅ Fallback succeeded.")
+                    self.finished.emit(True)
+                    return True 
+                else:
+                    self.log.emit(f"❌ Fallback failed: {stderr.decode().strip()}")
+            except Exception as e:
+                self.log.emit(f"❌ Fallback exception: {str(e)}")
+
+        self.finished.emit(False)
+        return False 
+    
+def log_metadata(run_acc, output_dir, metadata, elapsed_time,
+                 start_time=None, end_time=None, total_size=None):
+    global log_file_name
 
     if log_file_name is None:
         log_file_name = f"NGS_data_downloader_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
 
     log_file_path = os.path.join(output_dir, log_file_name)
 
-    with log_lock:  
+    with log_lock:
         file_exists = os.path.exists(log_file_path)
 
-        with open(log_file_path, mode="a", newline="") as log_file:
+        with open(log_file_path, mode="a", newline="", encoding="utf-8") as log_file:
             writer = csv.writer(log_file)
 
             if not file_exists:
                 writer.writerow([
-                    "Run Accession", "Title", "Platform Model", "Total Bases", "Total Reads",
-                    "Organism", "Library Strategy", "Bioproject", "Biosample", "Elapsed Time", "Size (MB)"
+                    "Run Accession", "Title", "Platform", "Bases", "Reads",
+                    "Organism", "Strategy", "Bioproject", "Biosample",
+                    "Start Time", "End Time", "Elapsed Time", "Size (MB)"
                 ])
-
-            formatted_metadata = {
-                "Title": metadata.get("Title", "N/A"),
-                "Platform Model": metadata.get("Platform Model", "N/A"),
-                "Total Bases": metadata.get("Total Bases", "N/A"),
-                "Total Reads": metadata.get("Total Reads", "N/A"),
-                "Organism": metadata.get("Organism", "N/A"),
-                "Library Strategy": metadata.get("Library Strategy", "N/A"),
-                "Bioproject": metadata.get("Bioproject", "N/A"),
-                "Biosample": metadata.get("Biosample", "N/A"),
-            }
 
             if total_size is None:
                 final_output_dir = os.path.abspath(os.path.join(output_dir, run_acc))
                 if os.path.exists(final_output_dir):
                     total_size = sum(
-                        os.path.getsize(os.path.join(final_output_dir, f)) for f in os.listdir(final_output_dir)
-                    ) / (1024 * 1024)  
+                        os.path.getsize(os.path.join(final_output_dir, f))
+                        for f in os.listdir(final_output_dir)
+                        if os.path.isfile(os.path.join(final_output_dir, f))
+                    ) / (1024 * 1024)
                 else:
-                    total_size = "N/A"  
+                    total_size = "N/A"
 
             formatted_size = f"{total_size:.2f} MB" if isinstance(total_size, (int, float)) else "N/A"
 
             writer.writerow([
                 run_acc,
-                formatted_metadata["Title"], formatted_metadata["Platform Model"],
-                formatted_metadata["Total Bases"], formatted_metadata["Total Reads"],
-                formatted_metadata["Organism"], formatted_metadata["Library Strategy"],
-                formatted_metadata["Bioproject"], formatted_metadata["Biosample"],
-                elapsed_time, formatted_size
+                metadata.get("Title", "N/A"),
+                metadata.get("Platform", "N/A"),
+                metadata.get("Bases", "N/A"),
+                metadata.get("Reads", "N/A"),
+                metadata.get("Organism", "N/A"),
+                metadata.get("Strategy", "N/A"),
+                metadata.get("Bioproject", "N/A"),
+                metadata.get("Biosample", "N/A"),
+                start_time or "N/A",
+                end_time or "N/A",
+                elapsed_time,
+                formatted_size
             ])
+           
+def select_all_items(tree_widget: QTreeWidget):
+    total_count = tree_widget.topLevelItemCount()
+    selected_count = len(tree_widget.selectedItems())
 
-    print(f"✅ Metadata logged successfully for {run_acc}")
-            
-def download_and_convert_sra_to_fastq(run_acc, output_dir, status_labels, progress_bars, index, 
-                                      top, total_items, status_window, download_log, start_time_str, 
-                                      download_list_tree, selected_format):
-    global completed_items, failed_files, active_threads, stop_flag, start_button  
+    should_select = selected_count < total_count
 
-    if run_acc in completed_items:
-        print(f"⚠️ {run_acc} is already in completed items. Skipping re-download.")
+    for i in range(total_count):
+        item = tree_widget.topLevelItem(i)
+        item.setSelected(should_select)
+
+def update_download_count(label, tree_widget):
+    count = tree_widget.topLevelItemCount()
+    label.setText(f"Download List: {count:,} items")
+
+def move_to_download_list(search_tree, download_tree, label_download_count):
+    selected_items = search_tree.selectedItems()
+    if not selected_items:
         return
 
-    if stop_flag:
-        print("🚨 Download stopped by user. Aborting SRA conversion.")
-        return
+    column_count = search_tree.columnCount()
+    download_tree.setColumnCount(column_count)
+    headers = [search_tree.headerItem().text(i) for i in range(column_count)]
+    download_tree.setHeaderLabels(headers)
 
-    if not start_time_str:
-        start_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    existing_accessions = set()
+    for i in range(download_tree.topLevelItemCount()):
+        existing_accessions.add(download_tree.topLevelItem(i).text(0))
 
-    task_start_time = time.time()
-    print(f"Task started for {run_acc} at {datetime.now().strftime('%m-%d %H:%M:%S')}")
-
-    prefetch_output_dir = r"C:\SRA_Virtual_Folder\prefetch_output"
-    sra_folder_path = os.path.join(prefetch_output_dir, run_acc)
-    sra_file_path = os.path.join(sra_folder_path, f"{run_acc}.sra")
-
-    thread = threading.current_thread()
-    active_threads.append(thread)
-
-    def update_progress(progress, message):
-        if status_window.winfo_exists():
-            top.after(0, lambda: progress_bars[index].config(mode="determinate", value=progress))
-            top.after(0, lambda: status_labels[index].config(text=message))
-            
-    try:
-        update_progress(5, "Checking disk space and prefetching SRA file...")
-
-        if stop_flag:
-            print("🚨 Download stopped by user. Aborting.")
-            return False
-
-        if not check_total_disk_space_and_prefetch(top, [run_acc], prefetch_output_dir):
-            raise RuntimeError(f"Prefetch failed or insufficient disk space for {run_acc}")
-
-        if stop_flag:
-            print("🚨 Download stopped by user. Aborting SRA conversion.")
-            return False
-
-        if not os.path.exists(sra_file_path):
-            raise FileNotFoundError(f"Prefetch completed, but SRA file does not exist at: {sra_file_path}")
-
-        print(f"Using SRA file: {sra_file_path}")
-
-        final_output_dir = os.path.abspath(os.path.join(output_dir, run_acc))
-        os.makedirs(final_output_dir, exist_ok=True)
-        if not os.access(final_output_dir, os.W_OK):
-            raise PermissionError(f"Cannot write to output directory: {final_output_dir}")
-
-        update_progress(10, "Preparing directories...")
-
-        conversion_success = False
-        
-        if selected_format == "FASTQ":
-            update_progress(30, "Running fastq-dump...")
-
-            fastq_cmd = f'fastq-dump --split-files --gzip "{sra_file_path}" --outdir "{final_output_dir}"'
-            conversion_success = run_conversion_command(fastq_cmd)
-
-        elif selected_format == "FASTA":
-            update_progress(30, "Running fastq-dump for FASTA format...")
-            fasta_cmd = f'fastq-dump "{sra_file_path}" --outdir "{final_output_dir}" --split-files --fasta 0'
-            conversion_success = run_conversion_command(fasta_cmd)
-
-        if not conversion_success:
-            raise RuntimeError(f"fastq-dump failed for {run_acc}")
-
-        if stop_flag:
-            print("🚨 Download stopped by user. Aborting SRA conversion.")
-            return False
-
-        update_progress(80, "Writing metadata to log...")
-
-        metadata = next((item for item in search_results if item["Run Accession"] == run_acc), {})
-
-        log_metadata(run_acc, output_dir, metadata, f"{(time.time() - task_start_time) // 60}m")
-
-        update_progress(100, "Task completed successfully!")
-
-    except Exception as e:
-        error_message = str(e)
-        print(f"Error for {run_acc}: {error_message}")
-        print(traceback.format_exc())
-        failed_files.append(run_acc)
-        update_progress(0, "Error")
-
-        if status_window.winfo_exists():
-            top.after(0, lambda: messagebox.showerror("Error", f"An error occurred for {run_acc}:\n{error_message}"))
-
-    finally:
-        completed_items.append(run_acc)
-        print(f"✅ DEBUG: {run_acc} added to completed_items. Now: {len(completed_items)} completed.")
-
-        if thread in active_threads:
-            active_threads.remove(thread)
-
-        try:
-            shutil.rmtree(sra_folder_path)
-            print(f"🗑 Deleted SRA folder: {sra_folder_path}")
-        except Exception as e:
-            print(f"⚠️ Failed to delete SRA folder {sra_folder_path}: {e}")
-
-        if 'start_button' in globals() and start_button and start_button.winfo_exists():
-            top.after(0, lambda: start_button.config(state="normal"))
-        else:
-            print("⚠️ start_button is not available! Skipping state change.")
-
-def get_ena_fastq_url(run_acc):
-    api_url = f"https://www.ebi.ac.uk/ena/portal/api/filereport?accession={run_acc}&result=read_run&fields=fastq_ftp"
-    response = requests.get(api_url)
-    if response.status_code == 200 and response.text.strip():
-        fastq_ftp_urls = response.text.strip().split("\n")[1]  
-        return fastq_ftp_urls.split(";")  
-    return []
-
-def download_and_convert_ena_fastq(run_acc, output_dir, status_labels, progress_bars, index, top, total_items, status_window):
-    global completed_items, failed_files, ena_search_results
-
-    task_start_time = time.time()
-    print(f"Task started for {run_acc} at {datetime.now().strftime('%m-%d %H:%M:%S')}")
-
-    if index >= len(progress_bars) or index >= len(status_labels):
-        print(f"⚠️ IndexError 방지: index={index}, progress_bars={len(progress_bars)}, status_labels={len(status_labels)}")
-        return
-
-    def update_progress(progress, message):
-        if status_labels[index].winfo_exists():
-            top.after(0, lambda: progress_bars[index].config(mode="determinate", value=progress))
-            top.after(0, lambda: status_labels[index].config(text=message))
-
-    elapsed_time = 0  
-    error_message = ""  
-    final_output_dir = os.path.abspath(os.path.join(output_dir, run_acc))
-    os.makedirs(final_output_dir, exist_ok=True)  
-
-    try:
-        update_progress(10, "Fetching ENA file paths...")
-        
-        api_url = f"https://www.ebi.ac.uk/ena/portal/api/filereport?accession={run_acc}&result=read_run&fields=fastq_ftp"
-        response = requests.get(api_url)
-        response.raise_for_status()
-
-        lines = response.text.strip().split("\n")
-        if len(lines) < 2:
-            raise FileNotFoundError(f"⚠️ No FASTQ files found for {run_acc} in ENA.")
-
-        fastq_ftp_urls = lines[1].strip().split("\t", 1)[-1]
-        fastq_files = fastq_ftp_urls.split(";") if ";" in fastq_ftp_urls else [fastq_ftp_urls]
-
-        if not fastq_files or fastq_files[0].strip() == "":
-            raise FileNotFoundError(f"⚠️ No FASTQ files found for {run_acc} in ENA.")
-
-        update_progress(30, "Preparing to download...")
-
-        for file_url in fastq_files:
-            https_url = f"https://{file_url.strip()}"
-            file_name = os.path.basename(file_url.strip())
-            output_file_path = os.path.join(final_output_dir, file_name)
-
-            update_progress(50, "Downloading...")
-            
-            retry_count = 3
-            for attempt in range(retry_count):
-                try:
-                    with requests.get(https_url, stream=True) as http_response:
-                        http_response.raise_for_status()
-                        with open(output_file_path, "wb") as file:
-                            for chunk in http_response.iter_content(chunk_size=8192):
-                                file.write(chunk)
-                    break
-                except requests.RequestException as err:
-                    print(f"❌ Download attempt {attempt + 1} failed: {err}")
-                    if attempt == retry_count - 1:
-                        error_message = f"❌ {run_acc}: Failed to download {file_name} after {retry_count} attempts."
-                        failed_files.append(run_acc)
-                        update_progress(0, "Download Failed")
-                        top.after(0, lambda: messagebox.showerror("Error", error_message))
-                        return
-                    time.sleep(5)  
-
-        update_progress(100, "Download completed!")
-        completed_items.append(run_acc)
-
-    except Exception as e:
-        error_message = f"An error occurred for {run_acc}:\n{str(e)}"
-        print(f"❌ {error_message}")
-        traceback.print_exc()
-        failed_files.append(run_acc)
-        update_progress(0, "Error")
-
-    finally:
-        elapsed_time = f"{(time.time() - task_start_time) // 60}m"
-
-        if os.path.exists(final_output_dir):
-            total_size = sum(
-                os.path.getsize(os.path.join(final_output_dir, f)) for f in os.listdir(final_output_dir)
-            ) / (1024 * 1024)  
-        else:
-            total_size = "N/A"
-
-        metadata = next((item for item in ena_search_results if item["Run Accession"] == run_acc), {})
-
-        print(f"✅ Download completed for {run_acc} in {elapsed_time}")
-
-        log_metadata(run_acc, output_dir, metadata, elapsed_time, total_size)
-
-        if error_message:
-            top.after(0, lambda: messagebox.showerror("Error", error_message))
-
-def select_all_items(tree):
-    for item in tree.get_children():
-        tree.selection_add(item)
-
-def SRA_to_FASTQ_downloader_GUI():
-    global accession_tree, download_list_tree, search_count_label, start_button  
-   
-    top = tk.Toplevel()
-    top.title("SRA to FASTQ Downloader")
-    top.geometry("1500x750")
-    top.resizable(False, False)
-    top.configure(bg="#F6F7F8")
+    for item in selected_items:
+        run_accession = item.text(0)
+        if run_accession in existing_accessions:
+            continue
     
-    image_path = get_resource_path("IDL_mark.png")
+        new_item = QTreeWidgetItem()
+        for i in range(item.columnCount()):
+            text = item.text(i)
+            new_item.setText(i, text)
+            if column_count == 6 and i != 3:
+                new_item.setTextAlignment(i, Qt.AlignCenter)
+            elif column_count == 9 and i != 1:
+                new_item.setTextAlignment(i, Qt.AlignCenter)
+    
+        download_tree.addTopLevelItem(new_item)
+        existing_accessions.add(run_accession)
 
-    if os.path.exists(image_path):  
-        image = Image.open(image_path)
-        image = image.resize((80, 80)) 
-        photo = ImageTk.PhotoImage(image)
+    label_download_count.setText(f"Download List: {download_tree.topLevelItemCount():,} items")
+    
+    if column_count == 6:
+        apply_ena_column_styles(download_tree)
+    elif column_count == 9:
+        apply_sra_column_styles(download_tree)
 
-        image_label = tk.Label(top, image=photo, bg="#F6F7F8")
-        image_label.image = photo  
-        image_label.place(relx=0.94, rely=0.02)
+def remove_from_download_list(download_tree, download_list_label):
+    selected_items = download_tree.selectedItems()
+    for item in selected_items:
+        index = download_tree.indexOfTopLevelItem(item)
+        if index != -1:
+            download_tree.takeTopLevelItem(index)
+    update_download_count(download_list_label, download_tree)
+
+def on_database_change(ui, combo, load_more_button, tree_widget, download_widget, main_app=None):
+    if main_app:
+        main_app.reset_organism_combo()
+
+    selected = combo.currentText().strip().upper()
+
+    _toggle_email_area(ui, visible=(selected != "ENA"))
+
+    tree_widget.clear()
+    ui.treeDownloadList.clear()
+    ui.labelDownloadCount.setText(f"Download List: {0:,} items")
+    ui.labelSearchCount.setText(f"Search List: {0:,} items")
+    load_more_button.setVisible(selected == "SRA")
+
+    if main_app and main_app.current_search_slot:
+        ui.buttonSearch.clicked.disconnect(main_app.current_search_slot)
+        main_app.current_search_slot = None
+
+    if selected == "ENA":
+        ena_headers = [
+            "Run Accession",
+            "Study Accession",
+            "Sample Accession",
+            "Organism",
+            "Instrument Model",
+            "Library Strategy"
+        ]
+        
+        tree_widget.setColumnCount(len(ena_headers))
+        tree_widget.setHeaderLabels(ena_headers)
+        download_widget.setColumnCount(len(ena_headers))
+        download_widget.setHeaderLabels(ena_headers)
+    
+        apply_ena_column_styles(tree_widget)
+        apply_ena_column_styles(download_widget)
+        
+        handler = EnaSearchHandler(ui)
+        if main_app:
+            main_app.current_search_handler = handler
+            main_app.ena_search_handler = handler
+            handler.parent_app = main_app
+        main_app.current_search_slot = handler.start_search
+        ui.buttonSearch.clicked.connect(main_app.current_search_slot)
+    
+    elif selected == "SRA":
+        sra_headers = [
+            "Run Accession",
+            "Title",
+            "Platform Model",
+            "Total Bases",
+            "Total Reads",
+            "Organism",
+            "Library Strategy",
+            "Bioproject",
+            "Biosample"
+        ]
+        
+        tree_widget.setColumnCount(len(sra_headers))
+        tree_widget.setHeaderLabels(sra_headers)
+        download_widget.setColumnCount(len(sra_headers))
+        download_widget.setHeaderLabels(sra_headers)
+    
+        apply_sra_column_styles(tree_widget)
+        apply_sra_column_styles(download_widget)
+    
+        handler = SearchHandler(ui)
+        if main_app:
+            main_app.current_search_handler = handler
+            
+            handler.parent_app = main_app
+        
+        def sra_start():
+            handler.start_search(reset=True)
+    
+        main_app.current_search_slot = sra_start
+        ui.buttonSearch.clicked.connect(main_app.current_search_slot)
+        
+def _toggle_email_area(ui, visible: bool):
+    widgets = [
+        getattr(ui, "labelEmail_2", None),     
+        ui.lineEditEmail_2,                     
+        getattr(ui, "buttonSaveEmail_2", None)  
+    ]
+    for w in widgets:
+        if w:
+            w.setVisible(visible)
+
+def toggle_load_more(button, selected_db):
+    if selected_db == "SRA":
+        button.setEnabled(True)
     else:
-        image_label = tk.Label(top, text="", font=("", 8, ""), bg="#F6F7F8")
-        image_label.place(relx=0.9, rely=-0)
-    
-    email_label = tk.Label(top, text="Enter your email:", bg="#F6F7F8")
-    email_label.grid(row=0, column=0, padx=10, pady=10, sticky="w")
-    email_label.place(relx=0.34, rely=0.01)
+        button.setEnabled(False)
 
-    email_box = tk.Entry(top)
-    email_box.grid(row=0, column=1, sticky="w")
-    email_box.place(relx=0.42, rely=0.01, relwidth=0.13)
-    email_box.insert(0, load_email_from_config())  
+def download_selected(download_tree, output_dir, controller, format_selector, email_box, start_button=None):
+    selected_items = [download_tree.topLevelItem(i) for i in range(download_tree.topLevelItemCount())]
+    if not selected_items:
+        CustomMessageBox("No items selected for download.").exec()
+        return
 
-    def set_email():
-        email = email_box.get()
-        if email:
-            Entrez.email = email
-            save_email_to_config(email)
-            messagebox.showinfo("Info", "Email saved successfully!")
-        else:
-            messagebox.showerror("Error", "Please enter a valid email.")
+    email = email_box.text().strip()
+    if not email:
+        CustomMessageBox("Please enter your email before downloading.").exec()
+        return
 
-    save_email_button = tk.Button(top, cursor="hand2", bg="#E0EDF9", font=("Helvetica", 9), borderwidth=0.5, text="Save Email", command=set_email, width=10)
-    save_email_button.grid(row=0, column=2)
-    save_email_button.place(relx=0.56, rely=0.01)
-    
-    format_label = tk.Label(top, text="Select format:", bg="#F6F7F8")
-    format_label.grid(row=1, column=0, padx=10, pady=10, sticky="w")
-    format_label.place(relx=0.42, rely=0.88)
+    selected_format = format_selector.currentText()
 
-    format_combo = ttk.Combobox(top, values=["FASTQ", "FASTA"], state="readonly", width=10, cursor="hand2")
-    format_combo.grid(row=1, column=1, padx=10, pady=10, sticky="w")
-    format_combo.set("FASTQ")  # Set default value
-    format_combo.place(relx=0.48, rely=0.88)
-    
-    def download_selected(download_list_frame, selected_directory_label, download_button, download_label, 
-                          top, format_combo, database_combo, start_button):
-        global download_list_tree
-    
-        latest_download_list_tree = None
-        for widget in download_list_frame.winfo_children():
-            if isinstance(widget, ttk.Treeview):
-                latest_download_list_tree = widget
-                print("DEBUG: Found latest download_list_tree for download.")
-                break
-    
-        if not latest_download_list_tree or not latest_download_list_tree.winfo_exists():
-            messagebox.showerror("Error", "Download list is not available. Please retry.")
-            print("ERROR: download_list_tree does not exist! Aborting download.")
-            return
-    
-        output_dir = selected_directory_label.cget("text").split(": ")[0].strip()
-        if output_dir == 'None' or not os.path.isdir(output_dir):
-            messagebox.showerror("Error", "Please select a valid output directory.")
-            return
-    
-        selected_items = latest_download_list_tree.get_children()
-        if not selected_items:
-            messagebox.showerror("Error", "No accession selected!")
-            return
-    
-        download_items = [latest_download_list_tree.item(item)['values'][-1] for item in selected_items]
-    
-        if any(acc == "N/A" or not acc for acc in download_items):
-            messagebox.showerror("Error", "One or more items have an invalid Run Accession!")
-            return
-    
-        selected_format = format_combo.get()
-        selected_db = database_combo.get()  
-    
-        print(f"DEBUG: Calling open_download_status_window with {len(download_items)} items, format: {selected_format}, DB: {selected_db}")
-    
-        if 'start_button' in globals() and start_button and start_button.winfo_exists():
-            print("✅ Re-enabling Start button before download.")
-            start_button.config(state="normal")
-    
-        open_download_status_window(top, download_items, output_dir, latest_download_list_tree, selected_format, selected_db, start_button)
-    
-    database_label = tk.Label(top, text="Select Database:", bg="#F6F7F8")
-    database_label.place(relx=0.18, rely=0.01)
+    download_data = []
+    for item in selected_items:
+        metadata = {
+            "Run Accession": item.text(0),
+            "Title": item.text(1),
+            "Platform": item.text(2),
+            "Bases": item.text(3),
+            "Reads": item.text(4),
+            "Organism": item.text(5),
+            "Strategy": item.text(6),
+            "Bioproject": item.text(7),
+            "Biosample": item.text(8)
+        }
+        run_acc = metadata["Run Accession"]
+        download_data.append((run_acc, metadata))
 
-    database_combo = ttk.Combobox(top, values=["SRA", "ENA"], state="readonly", width=5, cursor="hand2")
-    database_combo.place(relx=0.25, rely=0.01)
-    database_combo.set("SRA")  
-    
-    search_label = tk.Label(top, text="Enter search query:", bg="#F6F7F8")
-    search_label.place(relx=0.34, rely=0.06)
-    
-    search_box = tk.Entry(top)
-    search_box.place(relx=0.42, rely=0.06, relwidth=0.13)
-    
-    search_button = tk.Button(
-        top, text="Search", command=lambda: search_ngs_data(
-            top, search_box, email_box, accession_tree, search_button, search_progress, load_more_button, database_combo, tree_frame  # 🔹 tree_frame 추가
-        ), cursor="hand2", bg="#E0EDF9", font=("Helvetica", 9), borderwidth=0.5, width=10, height=1
+    progress_window = DownloadStatusWindow(
+        download_items=download_data,
+        controller=controller,
+        output_dir=output_dir,
+        file_format=selected_format,
+        start_button=start_button
     )
-
-    search_button.place(relx=0.56, rely=0.06)
-    
-    search_box.bind('<Return>', lambda event: search_button.invoke())
-    
-    clear_button = tk.Button(
-        top, text="Clear Search", 
-        command=lambda: clear_search_results(search_button, search_progress, accession_tree, load_more_button, search_box),
-        cursor="hand2", bg="#E0EDF9", font=("Helvetica", 9), borderwidth=0.5, width=12, height=1
-        )
-    clear_button.place(relx=0.65, rely=0.06)
-
-    search_progress = ttk.Progressbar(top, mode="indeterminate", maximum=50) 
-    search_progress.place(relx=0.42, rely=0.1, relwidth=0.13)
-    
-    load_more_button = tk.Button(
-        top, cursor="hand2", bg="#E0EDF9", font=("Helvetica", 9), borderwidth=0.5,
-        text="Load More",
-        command=lambda: on_load_more_clicked(tree_frame, search_button, search_progress, load_more_button, email_box, database_combo),
-        width=10
-    )
-    load_more_button.place(relx=0.56, rely=0.1)
-    
-    def toggle_load_more(database):
-        if database == "SRA":
-            load_more_button["state"] = "normal"
-            load_more_button.place(relx=0.56, rely=0.1)  
-        elif database == "ENA":
-            load_more_button["state"] = "disabled"
-            load_more_button.place_forget() 
-
-        print(f"DEBUG: Load More button state set for {database}.")
-        if len(accession_tree.get_children()) == 0:
-            print("DEBUG: Search results still empty after toggle_load_more.")
-        else:
-            print("DEBUG: Search results NOT empty after toggle_load_more.")
-    
-    def on_database_change(event):
-        global accession_tree, download_list_tree, is_searching, search_state, search_results
-
-        clear_search_results(search_button, search_progress, accession_tree, load_more_button, search_box)  
-
-        selected_db = database_combo.get()
-        print(f"DEBUG: on_database_change triggered, Database changed to {selected_db}")
-
-        toggle_load_more(selected_db)
-
-        try:
-            if download_list_tree and download_list_tree.winfo_exists():
-                download_list_tree.delete(*download_list_tree.get_children())
-                download_count_label.config(text="Download List: 0 items", bg="#F6F7F8")
-            else:
-                raise NameError
-        except NameError:
-            print("DEBUG: download_list_tree is not available! Recreating...")
-            for widget in download_list_frame.winfo_children():
-                widget.destroy()
-
-            columns = ("Title", "Platform Model", "Total Bases", "Total Reads", "Organism", 
-                       "Library Strategy", "Bioproject", "Biosample", "Runs Accession")
-
-            download_list_tree = ttk.Treeview(download_list_frame, columns=columns, show="headings", height=10)
-
-            for col in columns:
-                download_list_tree.heading(col, text=col)
-                if col in ["Total Bases", "Total Reads"]:
-                    download_list_tree.column(col, anchor="e")
-                else:
-                    download_list_tree.column(col, anchor="center")
-
-            scrollbar_dl = ttk.Scrollbar(download_list_frame, orient="vertical", command=download_list_tree.yview)
-            download_list_tree.configure(yscrollcommand=scrollbar_dl.set)
-            scrollbar_dl.pack(side='right', fill='y')
-            download_list_tree.pack(side='left', fill='both', expand=True)
-
-        try:
-            if accession_tree and accession_tree.winfo_exists():
-                accession_tree.delete(*accession_tree.get_children())
-                update_accession_list_count(accession_tree, search_count_label)
-            else:
-                raise NameError
-        except NameError:
-            print("DEBUG: accession_tree is not available! Recreating...")
-            for widget in tree_frame.winfo_children():
-                widget.destroy()
-
-            accession_tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
-
-            for col in columns:
-                accession_tree.heading(col, text=col)
-                if col in ["Total Bases", "Total Reads"]:
-                    accession_tree.column(col, anchor="e")
-                else:
-                    accession_tree.column(col, anchor="center")
-
-            scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=accession_tree.yview)
-            accession_tree.configure(yscrollcommand=scrollbar.set)
-            scrollbar.pack(side='right', fill='y')
-            accession_tree.pack(side='left', fill='both', expand=True)
-
-        completed_items.clear()  
-        failed_files.clear()  
-        search_results.clear()
-        update_accession_list_count(accession_tree, search_count_label)
-        print("DEBUG: Reset completed!")
-        
-        top.update_idletasks()
-
-    database_combo.bind("<<ComboboxSelected>>", on_database_change)
-    
-    tree_frame = tk.Frame(top)
-    tree_frame.place(relx=0.05, rely=0.15, relwidth=0.9, relheight=0.35)
-    
-    search_count_label = tk.Label(top, text="Search List: 0 items", bg="#F6F7F8")
-    search_count_label.place(relx=0.05, rely=0.12)
-
-    select_all_accession_button = tk.Button(
-        top, text="Select All", bg="#E0EDF9", cursor="hand2",
-        command=lambda: select_all_items(accession_tree)
-        )
-    select_all_accession_button.place(relx=0.05, rely=0.08)
-
-    columns = ("Title", "Platform Model", "Total Bases", "Total Reads", "Organism", "Library Strategy", "Bioproject", "Biosample", "Runs Accession")
-    accession_tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
-    
-    accession_tree.column("Title", width=250)
-    accession_tree.column("Platform Model", width=150, anchor="center")
-    accession_tree.column("Total Bases", width=120, anchor="e")
-    accession_tree.column("Total Reads", width=120, anchor="e")
-    accession_tree.column("Organism", width=150, anchor="center")
-    accession_tree.column("Library Strategy", width=120, anchor="center")
-    accession_tree.column("Bioproject", width=115, anchor="center")
-    accession_tree.column("Biosample", width=115, anchor="center")
-    accession_tree.column("Runs Accession", width=120, anchor="center")
-    
-    for col in columns:
-        accession_tree.heading(col, text=col)
-        if col in ["Total Bases", "Total Reads"]:
-            accession_tree.column(col, anchor="e")
-        else:
-            accession_tree.column(col, anchor="center")
-    
-    scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=accession_tree.yview)
-    accession_tree.configure(yscrollcommand=scrollbar.set)
-    scrollbar.pack(side='right', fill='y')
-    accession_tree.pack(side='left', fill='both', expand=True)
-    
-    update_accession_list_count(accession_tree, search_count_label)
-    
-    move_button = tk.Button(
-        top, cursor="hand2", bg="#E0EDF9", font=("Helvetica", 9), borderwidth=0.5,
-        text="Move to Download List",
-        command=lambda: move_to_download_list(tree_frame, download_list_frame),  # ✅ download_list_frame 추가
-        width=25
-    )
-    move_button.place(relx=0.35, rely=0.53)
-
-    download_list_frame = tk.Frame(top)
-    download_list_frame.place(relx=0.05, rely=0.6, relwidth=0.9, relheight=0.2)
-        
-    download_list_tree = ttk.Treeview(download_list_frame, columns=columns, show="headings", height=10)
-    download_list_tree.column("Title", width=250)
-    download_list_tree.column("Platform Model", width=150, anchor="center")
-    download_list_tree.column("Total Bases", width=120, anchor="e")
-    download_list_tree.column("Total Reads", width=120, anchor="e")
-    download_list_tree.column("Organism", width=150, anchor="center")
-    download_list_tree.column("Library Strategy", width=120, anchor="center")
-    download_list_tree.column("Bioproject", width=115, anchor="center")
-    download_list_tree.column("Biosample", width=115, anchor="center")
-    download_list_tree.column("Runs Accession", width=120, anchor="center")
-    
-    for col in columns:
-        download_list_tree.heading(col, text=col)
-        if col in ["Total Bases", "Total Reads"]:
-            download_list_tree.column(col, anchor="e")
-        else:
-            download_list_tree.column(col, anchor="center")
-    
-    scrollbar_dl = ttk.Scrollbar(download_list_frame, orient="vertical", command=download_list_tree.yview)
-    download_list_tree.configure(yscrollcommand=scrollbar_dl.set)
-    scrollbar_dl.pack(side='right', fill='y')
-    download_list_tree.pack(side='left', fill='both', expand=True)
-
-    download_count_label = tk.Label(top, text="Download List: 0 items", bg="#F6F7F8")
-    download_count_label.place(relx=0.05, rely=0.57)
-    
-    select_all_download_button = tk.Button(
-        top, text="Select All", bg="#E0EDF9", cursor="hand2",
-        command=lambda: select_all_items(download_list_tree)
-        )
-    select_all_download_button.place(relx=0.05, rely=0.53)    
-
-    def update_download_count(download_list_frame):
-        latest_download_list_tree = None
-        for widget in download_list_frame.winfo_children():
-            if isinstance(widget, ttk.Treeview):
-                latest_download_list_tree = widget
-                print("DEBUG: Found latest download_list_tree for counting.")
-                break
-    
-        if not latest_download_list_tree or not latest_download_list_tree.winfo_exists():
-            print("ERROR: Cannot update count. download_list_tree does not exist!")
-            return
-    
-        count = len(latest_download_list_tree.get_children())
-        download_count_label.config(text=f"Download List: {count} items")
-    
-    def move_to_download_list(tree_frame, download_list_frame):
-        global accession_tree, download_list_tree
-    
-        for widget in tree_frame.winfo_children():
-            if isinstance(widget, ttk.Treeview):
-                accession_tree = widget
-                print("DEBUG: Found latest accession_tree.")
-                break
-    
-        if not accession_tree or not accession_tree.winfo_exists():
-            messagebox.showerror("Error", "Search list is not available. Please retry.")
-            print("ERROR: accession_tree does not exist! Aborting move.")
-            return
-    
-        latest_download_list_tree = None
-        for widget in download_list_frame.winfo_children():
-            if isinstance(widget, ttk.Treeview):
-                latest_download_list_tree = widget
-                print("DEBUG: Found latest download_list_tree.")
-                break
-    
-        if not latest_download_list_tree or not latest_download_list_tree.winfo_exists():
-            messagebox.showerror("Error", "Download list is not available. Please retry.")
-            print("ERROR: download_list_tree does not exist! Aborting move.")
-            return
-    
-        selected_items = accession_tree.selection()
-        if not selected_items:
-            messagebox.showerror("Error", "No accession selected!")
-            return
-    
-        for item in selected_items:
-            values = accession_tree.item(item)['values']
-            accession_tree.delete(item)
-            latest_download_list_tree.insert("", "end", values=values)
-    
-        update_download_count(download_list_frame) 
-        update_accession_list_count(accession_tree, search_count_label)  
-
-    def remove_from_download_list(download_list_frame):
-        latest_download_list_tree = None
-        for widget in download_list_frame.winfo_children():
-            if isinstance(widget, ttk.Treeview):
-                latest_download_list_tree = widget
-                print("DEBUG: Found latest download_list_tree for removal.")
-                break
-    
-        if not latest_download_list_tree or not latest_download_list_tree.winfo_exists():
-            messagebox.showerror("Error", "Download list is not available. Please retry.")
-            print("ERROR: download_list_tree does not exist! Aborting removal.")
-            return
-    
-        selected_items = latest_download_list_tree.selection()
-        if not selected_items:
-            messagebox.showerror("Error", "No item selected!")
-            return
-    
-        for item in selected_items:
-            latest_download_list_tree.delete(item)
-    
-        update_download_count(download_list_frame)
-        update_accession_list_count(accession_tree, search_count_label) 
-
-    remove_button = tk.Button(
-        top, cursor="hand2", bg="#E0EDF9", font=("Helvetica", 9), borderwidth=0.5,
-        text="Remove from Download List",
-        command=lambda: remove_from_download_list(download_list_frame),
-        width=25
-    )
-    remove_button.place(relx=0.5, rely=0.53)
-    
-    file_select_button = tk.Button(top, cursor="hand2", bg="#E0EDF9", font=("Helvetica", 9), borderwidth=0.5, text="Select Directory", command=lambda: select_directory(selected_directory_label), width=25)
-    file_select_button.place(relx=0.42, rely=0.81)
-            
-    selected_directory_label = tk.Label(top, text=": None", bg="#F6F7F8", font=("",9,"italic"))
-    selected_directory_label.place(relx=0.55, rely=0.81)
-    
-    download_label = tk.Label(top, text="")
-    
-    download_button = tk.Button(
-        top, font=("Helvetica", 12, "bold"), relief="ridge", cursor="hand2", bg="#4183BC", fg="white",
-        activebackground="#4183BC", activeforeground="white", borderwidth=3, text="Download Start", 
-        command=lambda: download_selected(download_list_frame, selected_directory_label, download_button, 
-                                          download_label, top, format_combo, database_combo, download_button),  
-        width=20
-    )
-
-
-    download_button.place(relx=0.41, rely=0.92)
-    
-    top.mainloop() 
-    
-def start_gui_after_sratoolkit_check():
-    top = tk.Tk()
-    top.withdraw() 
-
-    check_and_install_sratoolkit(top)
+    progress_window.show()

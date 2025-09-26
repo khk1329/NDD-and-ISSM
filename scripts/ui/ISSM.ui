@@ -982,7 +982,7 @@ QCheckBox::indicator:checked{image:url(:/icons/icons/circle-check.png)}QCheckBox
      <string/>
     </property>
     <property name="pixmap">
-     <pixmap resource="resource.qrc">:/icons/icons/IDL_mark.PNG</pixmap>
+     <pixmap>:/icons/icons/IDL_mark.PNG</pixmap>
     </property>
     <property name="scaledContents">
      <bool>true</bool>
