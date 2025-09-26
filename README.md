@@ -1,6 +1,6 @@
 # Windows Executable
 
-Latest release: in_silico_project_ver3.2.4.exe
+Latest release: in_silico_project_ver3.4.0.exe
 
 ※ Download from Releases → Assets
 
