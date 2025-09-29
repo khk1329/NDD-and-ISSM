@@ -50,7 +50,7 @@ This project contains **two independent modules**, each built using a different 
   - `in_silico_sequence_mining.py`
 
 ### NGS Dataset Downloader (NDD)
-- Built with **Tkinter**
+- Built with **PySide6 / Qt Designer**
 - Lightweight UI for searching, filtering, and downloading datasets from SRA/ENA
 - Modules:
   - `NGS_data_downloader.py`
