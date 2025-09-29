@@ -77,6 +77,8 @@ This project contains **two independent modules**, each built using a different 
 3. Search and select accessions
 4. Choose output format and click “Download Start”
 
+### Detailed instructions and troubleshooting
+- For detailed instructions and troubleshooting, please refer to the **User Guide** included in the repository (or release package).
 ---
 
 ## Tested Environment
