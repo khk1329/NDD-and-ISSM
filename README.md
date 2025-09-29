@@ -153,3 +153,19 @@ For questions, feedback, or bug reports: **kminchan1010@naver.com**
 ---
 
 Made for molecular biology and bioinformatics research.
+
+---
+
+## Release Notes
+### v3.4.0
+1. ISSM
+- Validate required inputs before Run Analysis; launch process_window only after passing checks.
+- Capped maximum CPU workers at 61.
+- The final completion message is emitted in the process window only when all files reach a terminal state; counts include both Completed + Cancelled.
+2. NDD
+- Show Organism distribution stats for search results and enable filtering by organism.
+- Write start and end timestamps to the log file.
+- Migrated the launcher and NGS Data Downloader (NDD) GUI from Tkinter → PySide6 for a unified, modern UI.
+- Switched NDD internal signaling to thread-safe queues.
+- Enabled Select All button in Selected list box.
+- The final completion message is emitted in the process window only when all files reach a terminal state; counts include both Completed + Cancelled.
