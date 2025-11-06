@@ -15,6 +15,7 @@ import gzip
 from concurrent.futures import ThreadPoolExecutor
 import re
 import ctypes
+import math
 from urllib.parse import quote_plus
 from collections import Counter
 from PySide6.QtWidgets import (
@@ -29,6 +30,48 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from ui.NGS_downloader import Ui_MainWindow
 from queue import Queue, Empty
+
+def _bytes_to_gb(n):
+    return n / (1024**3)
+
+def _fmt_gb(n):
+    return f"{_bytes_to_gb(n):.1f} GB"
+
+def _parse_mb_from_metadata(meta):
+
+    if not isinstance(meta, dict):
+        return None
+    candidates = [
+        "File capacity (MB)", "size_MB", "estimated_size_MB",
+        "Size(MB)", "size", "size_mb", "Size_MB"
+    ]
+    for k in candidates:
+        if k in meta and meta[k] is not None:
+            try:
+                return float(str(meta[k]).replace(",", "").strip())
+            except:
+                pass
+    return None
+
+def _ensure_free_space_or_fail(progress_put, error_emit, path_label, path_for_usage, required_bytes, run_acc):
+    try:
+        usage = shutil.disk_usage(path_for_usage)
+        free_b = usage.free
+    except Exception as e:
+        progress_put(f"❌ {path_label} Free space check failed: {e}", 0)
+        error_emit(f"Disk check failed on {path_label} for {run_acc}: {e}")
+        return False
+
+    if free_b < required_bytes:
+        need = _fmt_gb(required_bytes)
+        free = _fmt_gb(free_b)
+        msg = f"❌ Insufficient disk space\nRequired space: {need} / {path_label} Free on: {free}"
+        progress_put(msg, 0)
+
+        error_emit(f"Not enough free space on {path_label} for {run_acc}")
+        return False
+    return True
+
 
 def get_resource_path(relative_path):
     if getattr(sys, 'frozen', False):
@@ -418,6 +461,32 @@ class SraDownloadWorker(QThread):
             if self._stopped:
                 self._put_progress("❌ Canceled", 0)
                 return
+            est_mb = _parse_mb_from_metadata(self.metadata)
+            est_sra_bytes = int((est_mb if est_mb else 2048) * 1024**2)
+
+            FASTQ_FACTOR = 4.0
+            PREFETCH_OVERHEAD = 1 * 1024**3
+
+            prefetch_root = os.path.join("C:/NDD_dummy_file", self.run_acc)
+            output_root = self.output_dir
+
+            required_prefetch = est_sra_bytes + PREFETCH_OVERHEAD
+            required_output   = int(est_sra_bytes * FASTQ_FACTOR)
+
+            prefetch_drive_path = os.path.splitdrive(prefetch_root)[0] + os.sep
+            output_drive_path   = os.path.splitdrive(output_root)[0] + os.sep
+
+            if not _ensure_free_space_or_fail(self._put_progress, self.error.emit,
+                                              f"{prefetch_drive_path} (Temporary storage)",
+                                              prefetch_drive_path,
+                                              required_prefetch, self.run_acc):
+                return
+
+            if not _ensure_free_space_or_fail(self._put_progress, self.error.emit,
+                                              f"{output_drive_path} (Output folder)",
+                                              output_drive_path,
+                                              required_output, self.run_acc):
+                return    
     
             self._put_progress("Prefetching SRA...", 10)
     
@@ -465,7 +534,25 @@ class SraDownloadWorker(QThread):
                 self._put_progress("❌ .sra file not found", 0)
                 self.error.emit(f".sra file not found for {self.run_acc}")
                 return
-    
+            
+            try:
+                real_sra_bytes = os.path.getsize(sra_path)
+            except Exception:
+                real_sra_bytes = est_sra_bytes
+
+            final_required_output = int(real_sra_bytes * FASTQ_FACTOR)
+
+            if not _ensure_free_space_or_fail(self._put_progress, self.error.emit,
+                                              f"{output_drive_path} (Output folder)",
+                                              output_drive_path,
+                                              final_required_output, self.run_acc):
+                try:
+                    if os.path.isfile(sra_path):
+                        os.remove(sra_path)
+                except Exception:
+                    pass
+                return
+            
             self._put_progress("Downloading...", 50)
     
             out_dir = os.path.join(self.output_dir, self.run_acc)
@@ -491,11 +578,7 @@ class SraDownloadWorker(QThread):
                 else:
                     self.status.emit(f"🔁 Retry {attempt} failed for {self.run_acc}")
                     time.sleep(3)
-            
-            end_dt = datetime.now()
-            end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-            elapsed_str = str(end_dt - start_dt).split(".")[0]
-            
+
             if self._stopped:
                 self._put_progress("❌ Canceled", 0)
                 self._cleanup_out_dir_if_created()
@@ -521,7 +604,11 @@ class SraDownloadWorker(QThread):
                             os.remove(src)
                         except Exception as e:
                             self.status.emit(f"Compression error: {e}")
-    
+
+            end_dt = datetime.now()
+            end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            elapsed_str = str(end_dt - start_dt).split(".")[0]
+
             try:
                 log_metadata(
                     run_acc=self.run_acc,
@@ -1486,9 +1573,10 @@ class UIStateUtils:
         return directory
 
 def run_command_with_retries(command, retries=3):
+    env = os.environ.copy() 
     for attempt in range(1, retries + 1):
         try:
-            subprocess.run(command, shell=True, check=True)
+            subprocess.run(command, shell=True, check=True, env=env)  
             return True
         except subprocess.CalledProcessError:
             if attempt == retries:
