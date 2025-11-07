@@ -1,6 +1,6 @@
 # Windows Executable
 
-Latest release: in_silico_project_ver3.4.0.exe
+Latest release: in_silico_project_ver3.4.1.exe
 
 ※ Download from Releases → Assets
 
@@ -78,7 +78,7 @@ This project contains **two independent modules**, each built using a different 
 4. Choose output format and click “Download Start”
 
 ### Detailed instructions and troubleshooting
-- For detailed instructions and troubleshooting, please refer to the **In silico project(ver3.4)_User_manual.pdf** included in the repository (or release package).
+- For detailed instructions and troubleshooting, please refer to the **In silico project(ver3.4.1)_User_manual.pdf** included in the repository (or release package).
 ---
 
 ## Tested Environment
@@ -159,6 +159,12 @@ Made for molecular biology and bioinformatics research.
 ---
 
 ## Release Notes
+
+### v3.4.1
+1. NDD
+- Patches to minimize certificate-related issues during SRA-based search and download in NDD have been applied.
+  ㅣ-If certificate errors still occur when using version 3.4.1, refer to the Troubleshooting section of the manual.
+
 ### v3.4.0
 1. ISSM
 - Validate required inputs before Run Analysis; launch process_window only after passing checks.
