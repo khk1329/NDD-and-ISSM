@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 ################################################################################
-## Form generated from reading UI file 'ISSMrCnMmD.ui'
+## Form generated from reading UI file 'ISSMLGulTj.ui'
 ##
 ## Created by: Qt User Interface Compiler version 6.9.0
 ##
@@ -275,7 +275,7 @@ class Ui_In_silico_sequence_mining(object):
         self.percentagetextEdit.setDecimals(0)
         self.percentagetextEdit.setMinimum(1.000000000000000)
         self.percentagetextEdit.setMaximum(100.000000000000000)
-        self.percentagetextEdit.setValue(1.000000000000000)
+        self.percentagetextEdit.setValue(100.000000000000000)
         self.selectedFilesList = QListWidget(self.centralwidget)
         self.selectedFilesList.setObjectName(u"selectedFilesList")
         self.selectedFilesList.setGeometry(QRect(320, 110, 231, 441))
@@ -346,71 +346,6 @@ class Ui_In_silico_sequence_mining(object):
         self.selectedFilesList.setFrameShadow(QFrame.Shadow.Sunken)
         self.selectedFilesList.setLineWidth(1)
         self.selectedFilesList.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
-        self.label_10 = QLabel(self.centralwidget)
-        self.label_10.setObjectName(u"label_10")
-        self.label_10.setGeometry(QRect(700, 500, 121, 16))
-        font2 = QFont()
-        font2.setPointSize(8)
-        self.label_10.setFont(font2)
-        self.parallelProcessing = QDoubleSpinBox(self.centralwidget)
-        self.parallelProcessing.setObjectName(u"parallelProcessing")
-        self.parallelProcessing.setGeometry(QRect(630, 495, 60, 24))
-        self.parallelProcessing.setMaximumSize(QSize(60, 16777215))
-        font3 = QFont()
-        font3.setBold(False)
-        self.parallelProcessing.setFont(font3)
-        self.parallelProcessing.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
-        self.parallelProcessing.setStyleSheet(u"QDoubleSpinBox{background-color: white; color:black;}")
-        self.parallelProcessing.setDecimals(0)
-        self.parallelProcessing.setMinimum(1.000000000000000)
-        self.parallelProcessing.setMaximum(61.000000000000000)
-        self.parallelProcessing.setValue(4.000000000000000)
-        self.parallelProcessingCheckbox = QCheckBox(self.centralwidget)
-        self.parallelProcessingCheckbox.setObjectName(u"parallelProcessingCheckbox")
-        self.parallelProcessingCheckbox.setGeometry(QRect(630, 530, 211, 20))
-        palette = QPalette()
-        brush = QBrush(QColor(0, 0, 0, 255))
-        brush.setStyle(Qt.BrushStyle.SolidPattern)
-        palette.setBrush(QPalette.ColorGroup.Active, QPalette.ColorRole.WindowText, brush)
-        brush1 = QBrush(QColor(249, 250, 250, 255))
-        brush1.setStyle(Qt.BrushStyle.SolidPattern)
-        palette.setBrush(QPalette.ColorGroup.Active, QPalette.ColorRole.Button, brush1)
-        palette.setBrush(QPalette.ColorGroup.Active, QPalette.ColorRole.Text, brush)
-        palette.setBrush(QPalette.ColorGroup.Active, QPalette.ColorRole.ButtonText, brush)
-        palette.setBrush(QPalette.ColorGroup.Active, QPalette.ColorRole.Base, brush1)
-        palette.setBrush(QPalette.ColorGroup.Active, QPalette.ColorRole.Window, brush1)
-        brush2 = QBrush(QColor(0, 0, 0, 128))
-        brush2.setStyle(Qt.BrushStyle.SolidPattern)
-#if QT_VERSION >= QT_VERSION_CHECK(5, 12, 0)
-        palette.setBrush(QPalette.ColorGroup.Active, QPalette.ColorRole.PlaceholderText, brush2)
-#endif
-        palette.setBrush(QPalette.ColorGroup.Inactive, QPalette.ColorRole.WindowText, brush)
-        palette.setBrush(QPalette.ColorGroup.Inactive, QPalette.ColorRole.Button, brush1)
-        palette.setBrush(QPalette.ColorGroup.Inactive, QPalette.ColorRole.Text, brush)
-        palette.setBrush(QPalette.ColorGroup.Inactive, QPalette.ColorRole.ButtonText, brush)
-        palette.setBrush(QPalette.ColorGroup.Inactive, QPalette.ColorRole.Base, brush1)
-        palette.setBrush(QPalette.ColorGroup.Inactive, QPalette.ColorRole.Window, brush1)
-#if QT_VERSION >= QT_VERSION_CHECK(5, 12, 0)
-        palette.setBrush(QPalette.ColorGroup.Inactive, QPalette.ColorRole.PlaceholderText, brush2)
-#endif
-        palette.setBrush(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, brush)
-        palette.setBrush(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Button, brush1)
-        palette.setBrush(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, brush)
-        brush3 = QBrush(QColor(255, 255, 255, 135))
-        brush3.setStyle(Qt.BrushStyle.SolidPattern)
-        palette.setBrush(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, brush3)
-        palette.setBrush(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Base, brush1)
-        palette.setBrush(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Window, brush1)
-#if QT_VERSION >= QT_VERSION_CHECK(5, 12, 0)
-        palette.setBrush(QPalette.ColorGroup.Disabled, QPalette.ColorRole.PlaceholderText, brush2)
-#endif
-        self.parallelProcessingCheckbox.setPalette(palette)
-        self.parallelProcessingCheckbox.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.parallelProcessingCheckbox.setStyleSheet(u"QCheckBox::indicator {\n"
-"    width: 16px;\n"
-"    height: 16px;\n"
-"}\n"
-"QCheckBox::indicator:checked{image:url(:/icons/icons/circle-check.png)}QCheckBox::indicator:unchecked{image:url(:/icons/icons/circle-dashed.png)}")
         self.label_11 = QLabel(self.centralwidget)
         self.label_11.setObjectName(u"label_11")
         self.label_11.setGeometry(QRect(1120, 0, 81, 71))
@@ -442,9 +377,6 @@ class Ui_In_silico_sequence_mining(object):
         self.selectedFilesList.raise_()
         self.radioButton.raise_()
         self.radioButton_2.raise_()
-        self.label_10.raise_()
-        self.parallelProcessing.raise_()
-        self.parallelProcessingCheckbox.raise_()
         self.allFilesList.raise_()
 
         self.retranslateUi(In_silico_sequence_mining)
@@ -472,8 +404,6 @@ class Ui_In_silico_sequence_mining(object):
         self.label_9.setText(QCoreApplication.translate("In_silico_sequence_mining", u"Percentage of reads to extract from the total reads :", None))
         self.selectOutputButton.setText(QCoreApplication.translate("In_silico_sequence_mining", u"Select Output Path", None))
         self.startAnalysisButton.setText(QCoreApplication.translate("In_silico_sequence_mining", u"Start Analysis", None))
-        self.label_10.setText(QCoreApplication.translate("In_silico_sequence_mining", u"(min : 1 ~ max : 61)", None))
-        self.parallelProcessingCheckbox.setText(QCoreApplication.translate("In_silico_sequence_mining", u"Use custom parallel processing", None))
         self.label_11.setText("")
     # retranslateUi
 

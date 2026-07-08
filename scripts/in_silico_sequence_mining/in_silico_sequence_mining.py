@@ -2,11 +2,12 @@ import os
 import gzip
 import random
 import threading
-import matplotlib.pyplot as plt
 from Bio import SeqIO
 from Bio.Seq import reverse_complement
 from collections import Counter
 import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import time
 from datetime import datetime
 import itertools
@@ -23,6 +24,8 @@ import numpy as np
 import aiofiles
 import asyncio
 import io
+import subprocess
+import shutil
 from PySide6.QtCore import (
     QCoreApplication, QDate, QDateTime, QLocale, QMetaObject, QObject, QPoint, QRect,
     QSize, QTime, QUrl, Qt, QTimer, QEventLoop, Slot, Q_ARG, QSettings, QThread, Signal
@@ -39,19 +42,22 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QHeaderView)
 import queue
 import uuid
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from queue import Queue
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from ui.ISSM import Ui_In_silico_sequence_mining
 
-matplotlib.use('Agg')
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 analysis_cancelled = {"flag": False}
 
 lock = threading.Lock()
+
+_SEQKIT_PATH_CACHE = None
+_SEQKIT_PATH_CHECKED = False
+_SEQKIT_PATH_ERROR = None
+_SEQKIT_PATH_LOCK = threading.Lock()
 
 logging.basicConfig(
     level=logging.DEBUG,  
@@ -74,10 +80,9 @@ IUPAC_CODES = {
     "D": ["A", "G", "T"],
     "H": ["A", "C", "T"],
     "V": ["A", "C", "G"],
-    "N": ["A", "C", "G", "T"]
+    "N": ["A", "C", "G", "T"],
+    "I": ["A", "C", "G", "T"]
 }
-
-invalid_base_warning_shown = False
 
 def save_last_directory(key, path):
     settings = QSettings("MyCompany", "MyApp") 
@@ -110,6 +115,634 @@ def get_optimal_parallel_file_count(file_path=None):
 
     return min(parallel_count, 61)
 
+def get_app_base_dir():
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+def get_seqkit_path():
+    global _SEQKIT_PATH_CACHE
+    global _SEQKIT_PATH_CHECKED
+    global _SEQKIT_PATH_ERROR
+
+    with _SEQKIT_PATH_LOCK:
+        if _SEQKIT_PATH_CHECKED:
+            if _SEQKIT_PATH_CACHE:
+                return _SEQKIT_PATH_CACHE
+
+            raise FileNotFoundError(
+                _SEQKIT_PATH_ERROR or
+                "SeqKit executable was not found. Expected bundled tools/seqkit.exe or seqkit in PATH."
+            )
+
+        base_dir = get_app_base_dir()
+
+        candidate_paths = [
+            os.path.join(base_dir, "tools", "seqkit.exe"),
+            os.path.join(os.path.dirname(base_dir), "tools", "seqkit.exe"),
+            os.path.join(os.path.dirname(os.path.dirname(base_dir)), "tools", "seqkit.exe"),
+        ]
+
+        for seqkit_path in candidate_paths:
+            if os.path.isfile(seqkit_path):
+                _SEQKIT_PATH_CACHE = seqkit_path
+                _SEQKIT_PATH_CHECKED = True
+                logging.info(f"SeqKit executable found: {seqkit_path}")
+                return _SEQKIT_PATH_CACHE
+
+        path_seqkit = shutil.which("seqkit")
+        if path_seqkit:
+            _SEQKIT_PATH_CACHE = path_seqkit
+            _SEQKIT_PATH_CHECKED = True
+            logging.info(f"SeqKit executable found in PATH: {path_seqkit}")
+            return _SEQKIT_PATH_CACHE
+
+        _SEQKIT_PATH_ERROR = (
+            "SeqKit executable was not found. "
+            "Expected bundled tools/seqkit.exe or seqkit in PATH."
+        )
+        _SEQKIT_PATH_CHECKED = True
+
+        raise FileNotFoundError(_SEQKIT_PATH_ERROR)
+
+def run_seqkit_command(args, analysis_cancelled=None):
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    cmd = [get_seqkit_path()] + args
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        creationflags=creationflags
+    )
+
+    try:
+        while proc.poll() is None:
+            if analysis_cancelled and analysis_cancelled.get("flag"):
+                proc.terminate()
+
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+
+                raise InterruptedError("SeqKit command cancelled by user.")
+
+            time.sleep(0.1)
+
+        stdout, stderr = proc.communicate()
+
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(
+                proc.returncode,
+                cmd,
+                output=stdout,
+                stderr=stderr
+            )
+
+        return subprocess.CompletedProcess(
+            cmd,
+            proc.returncode,
+            stdout,
+            stderr
+        )
+
+    except Exception:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
+        raise
+
+def get_total_reads_with_seqkit(input_file, analysis_cancelled=None):
+    result = run_seqkit_command(["stats", "-T", input_file], analysis_cancelled)
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) < 2:
+        raise ValueError("SeqKit stats returned no data.")
+
+    header = lines[0].split("\t")
+    values = lines[1].split("\t")
+
+    if "num_seqs" not in header:
+        raise ValueError("SeqKit stats output does not contain num_seqs column.")
+
+    num_idx = header.index("num_seqs")
+    return int(values[num_idx].replace(",", ""))
+
+def run_seqkit_sample2(input_file, output_file, sample_size, analysis_cancelled=None):
+    run_seqkit_command([
+        "sample2",
+        "-n", str(sample_size),
+        "-2",
+        "-r",
+        "-o", output_file,
+        input_file
+    ], analysis_cancelled)
+    
+_ISSM_MATCHER_PATH_CACHE = None
+_ISSM_MATCHER_PATH_CHECKED = False
+_ISSM_MATCHER_PATH_ERROR = None
+_ISSM_MATCHER_PATH_LOCK = threading.Lock()
+
+def get_issm_matcher_path():
+    global _ISSM_MATCHER_PATH_CACHE
+    global _ISSM_MATCHER_PATH_CHECKED
+    global _ISSM_MATCHER_PATH_ERROR
+
+    with _ISSM_MATCHER_PATH_LOCK:
+        if _ISSM_MATCHER_PATH_CHECKED:
+            if _ISSM_MATCHER_PATH_CACHE:
+                return _ISSM_MATCHER_PATH_CACHE
+            raise FileNotFoundError(
+                _ISSM_MATCHER_PATH_ERROR or
+                "issm_matcher.exe was not found. Expected bundled tools/issm_matcher.exe or issm_matcher in PATH."
+            )
+
+        base_dir = get_app_base_dir()
+        candidate_paths = [
+            os.path.join(base_dir, "tools", "issm_matcher.exe"),
+            os.path.join(os.path.dirname(base_dir), "tools", "issm_matcher.exe"),
+            os.path.join(os.path.dirname(os.path.dirname(base_dir)), "tools", "issm_matcher.exe"),
+        ]
+
+        for matcher_path in candidate_paths:
+            if os.path.isfile(matcher_path):
+                _ISSM_MATCHER_PATH_CACHE = matcher_path
+                _ISSM_MATCHER_PATH_CHECKED = True
+                logging.info(f"ISSM matcher executable found: {matcher_path}")
+                return _ISSM_MATCHER_PATH_CACHE
+
+        path_matcher = shutil.which("issm_matcher")
+        if path_matcher:
+            _ISSM_MATCHER_PATH_CACHE = path_matcher
+            _ISSM_MATCHER_PATH_CHECKED = True
+            logging.info(f"ISSM matcher executable found in PATH: {path_matcher}")
+            return _ISSM_MATCHER_PATH_CACHE
+
+        _ISSM_MATCHER_PATH_ERROR = (
+            "issm_matcher.exe was not found. "
+            "Expected bundled tools/issm_matcher.exe or issm_matcher in PATH."
+        )
+        _ISSM_MATCHER_PATH_CHECKED = True
+        raise FileNotFoundError(_ISSM_MATCHER_PATH_ERROR)
+
+def normalize_matching_method(matching_method):
+    method = str(matching_method or "fast_biological").strip().lower()
+    if method in ("legacy", "legacy_fuzzy", "rapidfuzz", "fuzzy"):
+        return "legacy_fuzzy"
+    return "fast_biological"
+
+def should_use_issm_matcher(threshold, sampling_percentage, matching_method="fast_biological"):
+    try:
+        thr = float(threshold)
+    except Exception:
+        return False
+
+    if thr >= 100:
+        return True
+
+    return normalize_matching_method(matching_method) == "fast_biological"
+
+def get_recommended_matcher_threads():
+    cpu = os.cpu_count() or 1
+    if cpu <= 2:
+        return 1
+    return max(1, min(cpu - 1, 8))
+
+def write_temp_probe_fasta_for_matcher(probes, output_dir_path):
+    os.makedirs(output_dir_path, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="issm_probes_", suffix=".fasta", dir=output_dir_path)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        for idx, (name, seq) in enumerate(probes, start=1):
+            safe_name = str(name).strip() or f"probe_{idx}"
+            safe_seq = str(seq).replace(" ", "").replace("\t", "").upper()
+            safe_seq = safe_seq.replace("I", "N")
+            fh.write(f">{safe_name}\n{safe_seq}\n")
+    return path
+
+def parse_issm_matcher_probe_counts(result_file_path, probes):
+    probe_counts = Counter({name: 0 for name, _ in probes})
+    total_records = None
+    total_matched = None
+    in_probe_table = False
+
+    with open(result_file_path, "r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.rstrip("\n")
+            if not line:
+                if in_probe_table:
+                    in_probe_table = False
+                continue
+
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[0] in ("Total Selected Reads", "Total Selected Sequences"):
+                try:
+                    total_records = int(parts[1].replace(",", ""))
+                except Exception:
+                    pass
+                continue
+            if len(parts) >= 2 and parts[0] in ("Total Matched Reads", "Total Matched Sequences"):
+                try:
+                    total_matched = int(parts[1].replace(",", ""))
+                except Exception:
+                    pass
+                continue
+
+            if line.startswith("Probe Name\t"):
+                in_probe_table = True
+                continue
+            if line.startswith("Matched Reads Information") or line.startswith("Matched Sequences Information"):
+                in_probe_table = False
+                continue
+
+            if in_probe_table and len(parts) >= 3:
+                probe_name = parts[0]
+                try:
+                    probe_counts[probe_name] = int(parts[2].replace(",", ""))
+                except Exception:
+                    probe_counts[probe_name] = 0
+
+    return probe_counts, total_records, total_matched
+
+def append_issm_matcher_summary(summary_file_path, original_filename, total_records, start_time, end_time):
+    elapsed_time = str(end_time - start_time).split(".")[0]
+    header_line = "Index\tFilename\tRecordCount\tStartTime\tEndTime\tElapsedTime\n"
+
+    with lock:
+        existing_lines = []
+        if os.path.exists(summary_file_path):
+            with open(summary_file_path, "r", encoding="utf-8") as fh:
+                existing_lines = fh.read().strip().splitlines()
+
+        if not existing_lines:
+            existing_lines = [header_line.strip()]
+        elif existing_lines[0] != header_line.strip():
+            existing_lines = [header_line.strip()] + existing_lines
+
+        index_counter = len(existing_lines) if len(existing_lines) > 1 else 1
+        existing_lines.append(
+            f"{index_counter}\t{os.path.basename(original_filename)}\t{total_records}\t{start_time}\t{end_time}\t{elapsed_time}"
+        )
+
+        with open(summary_file_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(existing_lines) + "\n")
+
+def set_busy_progress(update_queue, input_file, message):
+    if update_queue is None:
+        return
+
+    update_queue.put(("progress_max", input_file, 0))
+    update_queue.put(("progress_update", input_file, 0))
+    update_queue.put(("status_update", input_file, message))
+
+def emit_percent_progress(
+    update_queue,
+    input_file,
+    phase,
+    processed=0,
+    total=None,
+    percentage=None,
+    unit="reads",
+    reset=False
+):
+
+    if update_queue is None:
+        return
+
+    try:
+        processed = max(0, int(processed))
+    except (TypeError, ValueError):
+        processed = 0
+
+    try:
+        valid_total = int(total) if total is not None else 0
+    except (TypeError, ValueError):
+        valid_total = 0
+
+    if valid_total > 0:
+        processed = min(processed, valid_total)
+        pct = int((processed * 100) / valid_total)
+        status = (
+            f"{phase} | {pct}% | "
+            f"{processed:,}/{valid_total:,} {unit}"
+        )
+    else:
+        try:
+            pct = int(percentage) if percentage is not None else 0
+        except (TypeError, ValueError):
+            pct = 0
+
+        pct = max(0, min(100, pct))
+        status = (
+            f"{phase} | {pct}% | "
+            f"{processed:,} {unit} processed"
+        )
+
+    pct = max(0, min(100, pct))
+
+    if reset:
+        update_queue.put(("progress_max", input_file, 100))
+
+    update_queue.put(("progress_update", input_file, pct))
+    update_queue.put(("status_update", input_file, status))
+
+def set_terminal_progress(
+    update_queue,
+    input_file,
+    message,
+    progress_value=0
+):
+    if update_queue is None:
+        return
+
+    progress_value = max(0, min(100, int(progress_value)))
+    update_queue.put(("progress_max", input_file, 100))
+    update_queue.put(("progress_update", input_file, progress_value))
+    update_queue.put(("status_update", input_file, message))
+
+
+def run_issm_matcher_process(
+    cmd,
+    analysis_cancelled=None,
+    update_queue=None,
+    input_file=None,
+    total_records=None,
+    unit="reads"
+):
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    stderr_lines = []
+    line_queue = queue.Queue()
+    last_emitted_percentage = -1
+    last_emitted_processed = 0
+
+    logging.info("ISSM matcher command started: " + " ".join(f'\"{c}\"' if " " in str(c) else str(c) for c in cmd))
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+    )
+
+    def _reader():
+        try:
+            for line in proc.stderr:
+                line_queue.put(line.rstrip("\n"))
+        except Exception as e:
+            line_queue.put(f"__READER_ERROR__\t{e}")
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+
+    try:
+        while proc.poll() is None:
+            if analysis_cancelled and analysis_cancelled.get("flag"):
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                raise InterruptedError("ISSM matcher cancelled by user.")
+
+            while True:
+                try:
+                    line = line_queue.get_nowait()
+                except queue.Empty:
+                    break
+                
+                stderr_lines.append(line)
+                logging.debug(f"ISSM matcher: {line}")
+
+                if (
+                    line.startswith("PROGRESS\t")
+                    and update_queue is not None
+                    and input_file is not None
+                ):
+                    try:
+                        parts = line.split("\t")
+                        processed = int(parts[1]) if len(parts) >= 2 else 0
+                        bytes_read = int(parts[2]) if len(parts) >= 4 else 0
+                        total_bytes = int(parts[3]) if len(parts) >= 4 else 0
+
+                        if total_records and total_records > 0:
+                            pct = max(
+                                0,
+                                min(
+                                    100,
+                                    int(
+                                        min(processed, total_records)
+                                        * 100
+                                        / total_records
+                                    ),
+                                ),
+                            )
+
+                            if pct != last_emitted_percentage:
+                                emit_percent_progress(
+                                    update_queue=update_queue,
+                                    input_file=input_file,
+                                    phase="Matching",
+                                    processed=processed,
+                                    total=total_records,
+                                    unit=unit,
+                                )
+                                last_emitted_percentage = pct
+                                last_emitted_processed = processed
+
+                        elif total_bytes > 0:
+                            pct = max(
+                                0,
+                                min(
+                                    100,
+                                    int(
+                                        min(bytes_read, total_bytes)
+                                        * 100
+                                        / total_bytes
+                                    ),
+                                ),
+                            )
+
+                            if pct != last_emitted_percentage:
+                                emit_percent_progress(
+                                    update_queue=update_queue,
+                                    input_file=input_file,
+                                    phase="Matching",
+                                    processed=processed,
+                                    total=None,
+                                    percentage=pct,
+                                    unit=unit,
+                                )
+                                last_emitted_percentage = pct
+                                last_emitted_processed = processed
+
+                        elif processed - last_emitted_processed >= 100000:
+                            update_queue.put(
+                                (
+                                    "status_update",
+                                    input_file,
+                                    f"Matching | {processed:,} {unit} processed",
+                                )
+                            )
+                            last_emitted_processed = processed
+
+                    except Exception:
+                        pass
+
+            time.sleep(0.1)
+
+        reader_thread.join(timeout=1)
+        while True:
+            try:
+                line = line_queue.get_nowait()
+            except queue.Empty:
+                break
+            stderr_lines.append(line)
+            logging.debug(f"ISSM matcher: {line}")
+
+        if proc.returncode != 0:
+            tail = "\n".join(stderr_lines[-20:])
+            raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=tail)
+
+        logging.info("ISSM matcher command completed.")
+        return stderr_lines
+
+    except Exception:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
+        raise
+
+def run_issm_matcher_exact_and_update(
+    input_file,
+    probes,
+    total_records,
+    output_file_path,
+    output_dir_path,
+    summary_file_path,
+    results,
+    selected_format,
+    original_filename,
+    start_time,
+    analysis_cancelled,
+    update_queue,
+    matcher_threads=None,
+    matcher_input_file=None,
+    threshold=100,
+    matching_method="fast_biological",
+):
+    probe_fasta_path = None
+    try:
+        actual_input_file = matcher_input_file or input_file
+        if matcher_threads is None:
+            matcher_threads = get_recommended_matcher_threads()
+        try:
+            matcher_threads = max(1, int(matcher_threads))
+        except Exception:
+            matcher_threads = get_recommended_matcher_threads()
+
+        unit = "reads" if selected_format == "fastq" else "sequences"
+        mode_label = (
+            "Fast biological"
+            if normalize_matching_method(matching_method) == "fast_biological"
+            else "Matcher"
+        )
+        
+        emit_percent_progress(
+            update_queue=update_queue,
+            input_file=input_file,
+            phase="Matching",
+            processed=0,
+            total=total_records if total_records else None,
+            percentage=0,
+            unit=unit,
+            reset=True
+        )
+        
+        logging.info(
+            f"{mode_label} matcher started with {matcher_threads} thread(s)."
+        )
+
+        probe_fasta_path = write_temp_probe_fasta_for_matcher(probes, output_dir_path)
+        matched_fasta_path = os.path.join(
+            output_dir_path,
+            f"{os.path.splitext(os.path.basename(input_file))[0]}_matched_reads.fasta",
+        )
+
+        cmd = [
+            get_issm_matcher_path(),
+            "--input", actual_input_file,
+            "--probes", probe_fasta_path,
+            "--result", output_file_path,
+            "--matched-fasta", matched_fasta_path,
+            "--format", selected_format,
+            "--threshold", str(float(threshold)),
+            "--threads", str(matcher_threads),
+            "--batch-size", "20000",
+        ]
+
+        run_issm_matcher_process(
+            cmd,
+            analysis_cancelled=analysis_cancelled,
+            update_queue=update_queue,
+            input_file=input_file,
+            total_records=total_records,
+            unit=unit
+        )
+
+        probe_counts, matcher_total_records, matcher_total_matched = (
+            parse_issm_matcher_probe_counts(output_file_path, probes)
+        )
+        if matcher_total_records is not None:
+            total_records = matcher_total_records
+
+        end_time = datetime.now()
+        append_issm_matcher_summary(
+            summary_file_path,
+            original_filename,
+            total_records,
+            start_time,
+            end_time,
+        )
+
+        with lock:
+            results["file_results"][original_filename] = {"sampled_records": total_records}
+            for probe_name, _ in probes:
+                count = probe_counts.get(probe_name, 0)
+                results["file_results"][original_filename][probe_name] = count
+                results["probe_results"].setdefault(probe_name, {})[original_filename] = count
+
+        emit_percent_progress(
+            update_queue=update_queue,
+            input_file=input_file,
+            phase="Matching",
+            processed=total_records if total_records else 0,
+            total=total_records if total_records else None,
+            percentage=100,
+            unit=unit
+        )
+        return probe_counts, total_records, matcher_total_matched
+
+    finally:
+        if probe_fasta_path and os.path.exists(probe_fasta_path):
+            try:
+                os.remove(probe_fasta_path)
+            except Exception as e:
+                logging.warning(f"Failed to remove temporary probe FASTA: {probe_fasta_path} — {e}")
+
 def browse_folder(file_paths, folder_label_entry, all_files_list_box, selected_file_list_box, all_files_count_label, selected_files_count_label, selected_format):
     last_dir = load_last_directory("input_folder")
     folder_path = QFileDialog.getExistingDirectory(None, "Select Directory", last_dir)
@@ -128,19 +761,23 @@ def browse_folder(file_paths, folder_label_entry, all_files_list_box, selected_f
 
 def list_files(folder_path, file_paths, all_files_list_box, selected_file_list_box, all_files_count_label, selected_files_count_label, selected_format):
 
+    fastq_extensions = (".fastq.gz", ".fastq", ".fq.gz", ".fq")
+    fasta_extensions = (".fasta.gz", ".fasta", ".fa.gz", ".fa", ".fna.gz", ".fna", ".fas.gz", ".fas")
+
     if selected_format == "fastq":
-        valid_extensions = (".fastq.gz", ".fastq", ".fq.gz", ".fq")
+        valid_extensions = fastq_extensions
     elif selected_format == "fasta":
-        valid_extensions = (".fasta.gz", ".fasta", ".fa.gz", ".fa", ".fna")
+        valid_extensions = fasta_extensions
     else:
-        valid_extensions = (".fastq.gz", ".fastq", ".fq.gz", ".fq", ".fasta.gz", ".fasta", ".fa.gz", ".fa", ".fna")
+        valid_extensions = fastq_extensions + fasta_extensions
 
     all_files_list_box.clear()
     file_paths.clear()
 
     for root, _, files in os.walk(folder_path):
         for file in files:
-            if file.endswith(valid_extensions):  
+            file_lower = file.lower()
+            if file_lower.endswith(valid_extensions):
                 full_path = os.path.join(root, file)
                 all_files_list_box.addItem(file)
                 file_paths[file] = full_path
@@ -223,21 +860,29 @@ def select_output_path(output_file_entry):
     settings.setValue("lastOutputFolder", output_dir_path)
     output_file_entry.setText(output_dir_path)
 
-def fuzzy_match(cached_sequences, target_name, read_sequence, threshold):
-    possible_sequences = cached_sequences.get(target_name, [])
+def fuzzy_match_prepared(possible_sequences, read_sequence, threshold):
+    if threshold >= 100:
+        for seq in possible_sequences:
+            if seq in read_sequence:
+                return True, 100
+        return False, 0
+
     for seq in possible_sequences:
         partial_ratio = fuzz.partial_ratio(seq, read_sequence)
         if partial_ratio >= threshold:
             return True, partial_ratio
+
     return False, 0
 
-def init_worker(_cached_sequences):
-    global shared_cached_sequences
-    shared_cached_sequences = _cached_sequences
+shared_probe_items = None
 
-def init_worker_all(shared_sequences, safe_cores=None):
-    global shared_cached_sequences
-    shared_cached_sequences = shared_sequences
+def init_worker(_probe_items):
+    global shared_probe_items
+    shared_probe_items = _probe_items
+
+def init_worker_all(_probe_items, safe_cores=None):
+    global shared_probe_items
+    shared_probe_items = _probe_items
 
     if safe_cores is not None and os.name == 'nt':
         try:
@@ -247,23 +892,33 @@ def init_worker_all(shared_sequences, safe_cores=None):
         except Exception as e:
             print(f"⚠️ Failed to set CPU affinity: {e}")
 
-def match_batch_sequences(batch, probes, threshold, batch_idx, cached_sequences):
+def match_batch_sequences(batch, threshold, batch_idx):
     matched = []
+    probe_items = shared_probe_items or []
 
-    for record in batch: 
+    for record in batch:
         if analysis_cancelled["flag"]:
             break
+
         read_id = record.id
         read_seq = str(record.seq)
+        read_len = len(read_seq)
 
-        for probe_name, probe_seq in probes:
-            probe_seq = probe_seq.upper()
-            
-            if len(read_seq) < len(probe_seq):
+        for probe_name, probe_len, possible_sequences, possible_sequences_rc in probe_items:
+            if read_len < probe_len:
                 continue
 
-            match_orig, score_orig = fuzzy_match(cached_sequences, probe_name, read_seq, threshold)
-            match_rc, score_rc = fuzzy_match(cached_sequences, probe_name, reverse_complement(read_seq), threshold)
+            match_orig, score_orig = fuzzy_match_prepared(
+                possible_sequences,
+                read_seq,
+                threshold
+            )
+
+            match_rc, score_rc = fuzzy_match_prepared(
+                possible_sequences_rc,
+                read_seq,
+                threshold
+            )
 
             if match_orig or match_rc:
                 matched.append((read_id, probe_name, score_orig, score_rc, read_seq))
@@ -271,25 +926,36 @@ def match_batch_sequences(batch, probes, threshold, batch_idx, cached_sequences)
     batch_size = len(batch)
     return matched, batch_idx, batch_size
 
-def match_batch_reads(records, probes, threshold, batch_index):
+def match_batch_reads(records, threshold, batch_index):
     matched = []
+    probe_items = shared_probe_items or []
+
     for read_id, read_seq in records:
         if analysis_cancelled["flag"]:
             break
-        for probe_name, probe_seq in probes:
-            probe_seq = probe_seq.upper()
 
-            if len(read_seq) < len(probe_seq):
+        read_len = len(read_seq)
+
+        for probe_name, probe_len, possible_sequences, possible_sequences_rc in probe_items:
+            if read_len < probe_len:
                 continue
 
-            match_orig, score_orig = fuzzy_match(shared_cached_sequences, probe_name, read_seq, threshold)
-            match_rc, score_rc = fuzzy_match(shared_cached_sequences, probe_name, reverse_complement(read_seq), threshold)
+            match_orig, score_orig = fuzzy_match_prepared(
+                possible_sequences,
+                read_seq,
+                threshold
+            )
+
+            match_rc, score_rc = fuzzy_match_prepared(
+                possible_sequences_rc,
+                read_seq,
+                threshold
+            )
 
             if match_orig or match_rc:
                 matched.append((read_id, probe_name, score_orig, score_rc, read_seq))
-                
+
     batch_size = len(records)
-    
     return matched, batch_index, batch_size
 
 def run_analysis(
@@ -301,20 +967,19 @@ def run_analysis(
     selected_format: str,
     analysis_cancelled,
     update_queue,
-    use_custom_parallel: bool,
-    custom_parallel_value: int
+    matching_method: str = "fast_biological"
 ):
     logging.debug("Analysis started.")
     logging.debug(f"Selected format: {selected_format}")
     logging.debug(f"Output directory: {output_dir_path}")
     logging.debug(f"Files ({len(selected_files)}): {selected_files[:5]}{'...' if len(selected_files)>5 else ''}")
-    logging.debug(f"Parameters — Threshold={threshold}, Sampling={sampling_percentage}%, Parallel={use_custom_parallel}:{custom_parallel_value}")
+    matching_method = normalize_matching_method(matching_method)
 
     probes = []
     for chunk in [c for c in probe_text.strip().split('>') if c.strip()]:
         lines = chunk.splitlines()
         name = lines[0].strip() if lines else ""
-        seq = ''.join(lines[1:]).strip().replace(' ', '')
+        seq = ''.join(lines[1:]).strip().replace(' ', '').upper()
         if not name or not seq:
             raise ValueError("Invalid probe entry (name/sequence is empty).")
         probes.append((name, seq))
@@ -322,8 +987,12 @@ def run_analysis(
     if probes:
         logging.debug(f"Example probe — {probes[0][0]}: {probes[0][1][:30]}{'...' if len(probes[0][1])>30 else ''}")
 
-    cached_sequences = prepare_probe_sequences(probes)
-    logging.debug(f"Cached sequences prepared: {len(cached_sequences)} keys.")
+    if should_use_issm_matcher(threshold, sampling_percentage, matching_method):
+        probe_items = []
+        logging.debug("Fast matcher mode selected; skipped Python IUPAC variant expansion.")
+    else:
+        probe_items = prepare_probe_match_items(probes)
+        logging.debug(f"Probe match items prepared: {len(probe_items)} items.")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     summary_path = os.path.join(output_dir_path, f"summary_result_{ts}.txt")
@@ -336,11 +1005,11 @@ def run_analysis(
     t = threading.Thread(
         target=process_files,
         args=(
-            selected_files, probes, threshold, sampling_percentage,
-            output_dir_path, selected_format, cached_sequences,
+            selected_files, probes, probe_items, threshold, sampling_percentage,
+            output_dir_path, selected_format,
             completed_files, total_files, summary_path, results,
             analysis_cancelled, update_queue,
-            use_custom_parallel, custom_parallel_value
+            matching_method
         ),
         daemon=True
     )
@@ -350,26 +1019,35 @@ def run_analysis(
     update_queue.put(("finished", True, f"Completed: processed {total_files} files."))
     
 def process_files(
-    selected_files, probes, threshold, sampling_percentage,
-    output_dir_path, selected_format, cached_sequences,
+    selected_files, probes, probe_items, threshold, sampling_percentage,
+    output_dir_path, selected_format,
     completed_files, total_files, summary_file_path, results,
     analysis_cancelled, update_queue,
-    use_custom_parallel, custom_parallel_value
+    matching_method="fast_biological"
 ):
 
     logging.debug("🚀 ThreadPoolExecutor Start")
+    matching_method = normalize_matching_method(matching_method)
+    use_fast_matcher = should_use_issm_matcher(threshold, sampling_percentage, matching_method)
     
-    if use_custom_parallel:
-        max_parallel = int(custom_parallel_value)
-        logging.info(f"User-defined parallel count: {max_parallel}")
+    matcher_threads = None
+
+    if use_fast_matcher:
+        max_parallel = 1
+        matcher_threads = get_recommended_matcher_threads()
+        logging.info(
+            f"ISSM fast matcher mode: file-level parallel count fixed to 1; "
+            f"auto matcher threads = {matcher_threads}; "
+            f"sampling={sampling_percentage}%; method={matching_method}; threshold={threshold}"
+        )
     else:
         max_parallel = get_optimal_parallel_file_count()
-        logging.info(f"Auto-detected parallel count: {max_parallel}")
+        logging.info(f"Legacy fuzzy mode auto parallel count: {max_parallel}")
 
     def run_file(input_file, output_file_specific):
-        try:
-            file_key = os.path.basename(input_file)
+        file_key = os.path.basename(input_file)
 
+        try:
             if analysis_cancelled["flag"]:
                 update_queue.put(("status_update", file_key, "🚫 Cancelled"))
                 return
@@ -381,10 +1059,26 @@ def process_files(
             )
 
             detect_func(
-                input_file, probes, threshold, sampling_percentage, output_file_specific,
-                completed_files, total_files, summary_file_path, cached_sequences,
-                results, output_dir_path, analysis_cancelled, update_queue
+                input_file,
+                probes,
+                probe_items,
+                threshold,
+                sampling_percentage,
+                output_file_specific,
+                completed_files,
+                total_files,
+                summary_file_path,
+                results,
+                output_dir_path,
+                analysis_cancelled,
+                update_queue,
+                matcher_threads=matcher_threads,
+                matching_method=matching_method
             )
+
+        except InterruptedError:
+            logging.info(f"🛑 Processing cancelled for file: {input_file}")
+            update_queue.put(("status_update", file_key, "🚫 Cancelled"))
 
         except Exception as e:
             logging.error(f"❌ {input_file} Error during processing: {e}")
@@ -392,11 +1086,22 @@ def process_files(
 
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
         futures = {}
+
         for input_file in selected_files:
-            
             file_key = os.path.basename(input_file)
 
             if not os.path.exists(input_file):
+                completed_files["had_error"] = True
+            
+                update_queue.put((
+                    "status_update",
+                    file_key,
+                    "❌ Error: Input file was not found."
+                ))
+            
+                with lock:
+                    completed_files["count"] += 1
+            
                 continue
     
             output_file_specific = os.path.join(
@@ -408,34 +1113,67 @@ def process_files(
             update_queue.put(("progress_update", file_key, 0))
             update_queue.put(("status_update", file_key, "Stand-by"))
     
+            if analysis_cancelled["flag"]:
+                update_queue.put(("status_update", file_key, "🚫 Cancelled"))
+                continue
+
             future = executor.submit(run_file, input_file, output_file_specific)
             futures[future] = file_key
     
         try:
-            for future in as_completed(futures):
+            pending = set(futures.keys())
+
+            while pending:
                 if analysis_cancelled["flag"]:
-                    for f in futures:
-                        if not f.running() and not f.done():
-                            f.cancel()
-                            file_key = futures[f]
-                            update_queue.put(("status_update", file_key, "🚫 Cancelled"))
+                    for future in pending:
+                        file_key = futures[future]
+
+                        if not future.running() and not future.done():
+                            if future.cancel():
+                                update_queue.put(("status_update", file_key, "🚫 Cancelled"))
+                            else:
+                                update_queue.put(("status_update", file_key, "🛑 Cancelling... Please wait."))
+                        else:
+                            update_queue.put(("status_update", file_key, "🛑 Cancelling... Please wait."))
+
                     break
-    
-                future.result()
+
+                done, pending = wait(
+                    pending,
+                    timeout=0.2,
+                    return_when=FIRST_COMPLETED
+                )
+
+                for future in done:
+                    future.result()
     
         except Exception as e:
             logging.error(f"❌ Error occurred during analysis: {e}")
             
     update_queue.put(("analysis_complete", "", "All analyses have been completed!"))
 
-def prepare_probe_sequences(probes):
-    cached_sequences = {}
+def prepare_probe_match_items(probes):
+    probe_items = []
 
-    for name, sequence in probes:
-        logging.debug(f"Converting target: {name}")
-        cached_sequences[name] = generate_possible_sequences(sequence.upper())
+    for probe_name, probe_seq in probes:
+        logging.debug(f"Preparing probe: {probe_name}")
 
-    return cached_sequences
+        probe_seq = probe_seq.upper()
+        possible_sequences = generate_possible_sequences(probe_seq)
+
+        possible_sequences_rc = [
+            str(reverse_complement(seq))
+            for seq in possible_sequences
+        ]
+
+        probe_items.append((
+            probe_name,
+            len(probe_seq),
+            possible_sequences,
+            possible_sequences_rc
+        ))
+
+    return probe_items
 
 def generate_possible_sequences(iupac_sequence):
     logging.debug("IUPAC code conversion started")
@@ -535,69 +1273,214 @@ def validate_fastq_format(file_path, analysis_cancelled=None):
         logging.error(f"FASTQ format validation failed: {e}")
         raise
 
-def FASTA_sampling(input_file, sampling_percentage, update_queue=None, min_reads=1, analysis_cancelled=None):
+def open_sequence_text_stream(file_path):
+    if file_path.endswith(".gz"):
+        return io.TextIOWrapper(gzip.open(file_path, "rb"), encoding="utf-8")
+    return open(file_path, "rt", encoding="utf-8")
+
+def shutdown_process_pool_fast(executor, pending_futures=None):
+    if executor is None:
+        return
+
+    if pending_futures:
+        for future in list(pending_futures):
+            try:
+                future.cancel()
+            except Exception:
+                pass
+
+    processes = []
     try:
+        processes = list(getattr(executor, "_processes", {}).values())
+    except Exception:
+        processes = []
+
+    for process in processes:
+        try:
+            if process.is_alive():
+                process.terminate()
+        except Exception:
+            pass
+
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        executor.shutdown(wait=False)
+    except Exception:
+        pass
+
+def FASTA_sampling(input_file, sampling_percentage, update_queue=None, min_reads=1, analysis_cancelled=None):
+    temp_output_file = None
+
+    try:
+        base_filename = (
+            os.path.basename(input_file)
+            .replace(".gz", "")
+            .replace(".fasta", "")
+            .replace(".fa", "")
+            .replace(".fna", "")
+        )
+        unique_id = uuid.uuid4().hex[:8]
+        temp_output_file = os.path.join(
+            tempfile.gettempdir(),
+            f"tmp_{base_filename}_{unique_id}.fasta.gz"
+        )
+
         if analysis_cancelled and analysis_cancelled.get("flag"):
-            raise InterruptedError("Sampling was cancelled before starting.")
+            raise InterruptedError("FASTA sampling cancelled before starting.")
 
-        if update_queue:
-            update_queue.put(("status_update", input_file, "Ready to sampling"))
+        if input_file.endswith(".gz") and not validate_gzip_file(input_file, analysis_cancelled):
+            raise ValueError(f"Invalid gzip file: {input_file}")
 
-        with open(input_file, "r") as handle:
-            fasta_records = []
-            for record in SeqIO.parse(handle, "fasta"):
-                if analysis_cancelled and analysis_cancelled["flag"]:
-                    return []
-                fasta_records.append(record)
+        try:
+            set_busy_progress(
+                update_queue,
+                input_file,
+                "Counting sequences..."
+            )
 
-        total_reads = len(fasta_records)
+            total_sequences = get_total_reads_with_seqkit(input_file, analysis_cancelled)
+            
+            sample_size = max(int(total_sequences * (sampling_percentage / 100)), min_reads)
+            sample_size = min(sample_size, total_sequences)
 
-        if total_reads == 0:
-            logging.warning(f"⚠ No sequences found in {input_file}")
+            if sample_size <= 0:
+                raise ValueError(f"No sequences available for sampling: {input_file}")
+
+            set_busy_progress(
+                update_queue,
+                input_file,
+                f"Sampling {sample_size:,} sequences..."
+            )
+
+            if analysis_cancelled and analysis_cancelled.get("flag"):
+                raise InterruptedError("FASTA sampling cancelled before SeqKit sampling.")
+
+            run_seqkit_sample2(input_file, temp_output_file, sample_size, analysis_cancelled)
+
+            if analysis_cancelled and analysis_cancelled.get("flag"):
+                raise InterruptedError("FASTA sampling cancelled after SeqKit sampling.")
+
+            if not os.path.exists(temp_output_file) or os.path.getsize(temp_output_file) == 0:
+                raise ValueError("SeqKit FASTA sampling produced an empty output file.")
+
             if update_queue:
-                update_queue.put(("status_update", input_file, "⚠ No sequences found"))
-            return []
+                update_queue.put((
+                        "status_update",
+                        input_file,
+                        "Sampling completed. Preparing matching..."
+                ))
 
-        sample_size = max(int(total_reads * (sampling_percentage / 100)), min_reads)
-        sample_size = min(sample_size, total_reads)
+            logging.info(f"✅ SeqKit FASTA sampling completed: {sample_size} sequences → {temp_output_file}")
+            return temp_output_file, sample_size
 
-        if analysis_cancelled and analysis_cancelled.get("flag"):
-            raise InterruptedError("Sampling cancelled before sampling step.")
+        except FileNotFoundError:
+            logging.warning("SeqKit not found. Falling back to Python FASTA sampling.")
+            if update_queue:
+                update_queue.put(("status_update", input_file, "SeqKit not found. Using standard Python FASTA sampling."))
 
-        sampled_records = random.sample(fasta_records, sample_size)
-        logging.info(f"✅ Sampled {sample_size} sequences from {total_reads} total sequences in {input_file}")
+        except InterruptedError:
+            raise
+
+        except subprocess.CalledProcessError as e:
+            logging.warning(f"SeqKit FASTA sampling failed. Falling back to Python sampling: {e.stderr}")
+            if update_queue:
+                update_queue.put(("status_update", input_file, "SeqKit failed. Using standard Python FASTA sampling."))
+
+        except Exception as e:
+            logging.warning(f"Unexpected SeqKit FASTA sampling error. Falling back to Python sampling: {e}")
+            if update_queue:
+                update_queue.put(("status_update", input_file, "SeqKit error. Using standard Python FASTA sampling."))
+
+        set_busy_progress(
+            update_queue,
+            input_file,
+            "Counting sequences...",
+        )
+
+        total_sequences = 0
+        with open_sequence_text_stream(input_file) as handle:
+            for record in SeqIO.parse(handle, "fasta"):
+                if analysis_cancelled and analysis_cancelled.get("flag"):
+                    raise InterruptedError("FASTA sampling cancelled during counting.")
+                total_sequences += 1
+
+        sample_size = max(int(total_sequences * (sampling_percentage / 100)), min_reads)
+        sample_size = min(sample_size, total_sequences)
+
+        if sample_size <= 0:
+            raise ValueError(f"No sequences available for sampling: {input_file}")
+
+        set_busy_progress(
+            update_queue,
+            input_file,
+            f"Sampling {sample_size:,} sequences...",
+        )
+
+        selected_indices = set(sorted(random.sample(range(total_sequences), sample_size)))
+        sampled_count = 0
+
+        with open_sequence_text_stream(input_file) as handle, gzip.open(temp_output_file, "wt") as output_handle:
+            for i, record in enumerate(SeqIO.parse(handle, "fasta")):
+                if analysis_cancelled and analysis_cancelled.get("flag"):
+                    raise InterruptedError("FASTA sampling cancelled during writing.")
+
+                if i in selected_indices:
+                    SeqIO.write(record, output_handle, "fasta")
+                    sampled_count += 1
 
         if update_queue:
-            update_queue.put(("progress_max", input_file, sample_size))
-            update_queue.put(("progress_update", input_file, sample_size))
-            update_queue.put(("status_update", input_file, f"✅ Sampled {sample_size:,} sequences"))
+            update_queue.put((
+                "status_update",
+                input_file,
+                "Sampling completed. Preparing matching...",
+            ))
 
-        return sampled_records
+        logging.info(f"✅ Python FASTA sampling completed: {sample_size} sequences → {temp_output_file}")
+        return temp_output_file, sample_size
 
-    except InterruptedError as ie:
-        logging.warning(f"🛑 Sampling cancelled for {input_file}: {ie}")
+    except InterruptedError:
+        if temp_output_file and os.path.exists(temp_output_file):
+            try:
+                os.remove(temp_output_file)
+                logging.warning(f"🛑 FASTA sampling cancelled. Temp file removed: {temp_output_file}")
+            except Exception as e:
+                logging.warning(f"⚠️ Failed to remove FASTA temp file during cancel: {e}")
+
         if update_queue:
             update_queue.put(("status_update", input_file, "🚫 Cancelled"))
-        return []
+
+        return None, None
 
     except Exception as e:
-        logging.error(f"❌ Error during FASTA sampling for {input_file}: {e}")
+        if temp_output_file and os.path.exists(temp_output_file):
+            try:
+                os.remove(temp_output_file)
+                logging.info(f"🧹 Removed FASTA temp file after sampling error: {temp_output_file}")
+            except Exception as err:
+                logging.warning(f"⚠️ Failed to remove FASTA temp file after error: {err}")
+
+        logging.error(f"❌ Error during FASTA sampling: {e}")
+
         if update_queue:
             if analysis_cancelled and analysis_cancelled.get("flag"):
                 update_queue.put(("status_update", input_file, "🚫 Cancelled"))
             else:
                 update_queue.put(("status_update", input_file, f"❌ Error: {e}"))
-        return []
+
+        return None, None
 
 def FASTA_detect_and_quantify_probe_batched(
-    input_file, probes, threshold, sampling_percentage, output_file_path,
+    input_file, probes, probe_items, threshold, sampling_percentage, output_file_path,
     completed_files, total_files, summary_file_path,
-    cached_sequences, results, output_dir_path,
-    analysis_cancelled, update_queue
+    results, output_dir_path,
+    analysis_cancelled, update_queue,
+    matcher_threads=None,
+    matching_method="fast_biological"
 ):
-    def fasta_batch_generator(records, batch_size):
+    def fasta_batch_generator(handle, batch_size):
         batch = []
-        for record in records:
+        for record in SeqIO.parse(handle, "fasta"):
             batch.append(record)
             if len(batch) == batch_size:
                 yield batch
@@ -608,43 +1491,144 @@ def FASTA_detect_and_quantify_probe_batched(
     processed_so_far = 0
     total_records = 0
     cancelled_early = False
+    sampled_file = None
+    sampled_count = None
+    had_error = False
     
     try:
         start_time = datetime.now()
         original_filename = input_file
 
-        fasta_records = FASTA_sampling(
-            input_file,
-            sampling_percentage,
-            update_queue=update_queue,
-            min_reads=1,
-            analysis_cancelled=analysis_cancelled
-        )
-
-        if not fasta_records:
-            raise ValueError(f"❌ No valid sequences found in {input_file}")
-
-        probe_names = np.array([name for name, _ in probes])
-        probe_dict = {name: seq for name, seq in probes}
+        file_to_use = input_file
+        
+        if sampling_percentage != 100:
+            sampled_file, sampled_count = FASTA_sampling(
+                input_file,
+                sampling_percentage,
+                update_queue=update_queue,
+                min_reads=1,
+                analysis_cancelled=analysis_cancelled
+            )
+        
+            if not sampled_file:
+                if analysis_cancelled.get("flag"):
+                    cancelled_early = True
+                    update_queue.put((
+                        "status_update",
+                        input_file,
+                        "🚫 Cancelled"
+                    ))
+                else:
+                    had_error = True
+                    completed_files["had_error"] = True
+            
+                return
+        
+            file_to_use = sampled_file
+            total_records = sampled_count
 
         if analysis_cancelled["flag"]:
             cancelled_early = True
             return
 
-        total_records = len(fasta_records)
-        BATCH_SIZE = 100
+        if should_use_issm_matcher(threshold, sampling_percentage, matching_method):
+            known_total_records = (
+                total_records
+                if total_records and total_records > 0
+                else 0
+            )
+            try:
+                _, matcher_total_records, _ = run_issm_matcher_exact_and_update(
+                    input_file=original_filename,
+                    matcher_input_file=file_to_use,
+                    probes=probes,
+                    total_records=known_total_records,
+                    output_file_path=output_file_path,
+                    output_dir_path=output_dir_path,
+                    summary_file_path=summary_file_path,
+                    results=results,
+                    selected_format="fasta",
+                    original_filename=original_filename,
+                    start_time=start_time,
+                    analysis_cancelled=analysis_cancelled,
+                    update_queue=update_queue,
+                    matcher_threads=matcher_threads,
+                    threshold=threshold,
+                    matching_method=matching_method,
+                )
+                processed_so_far = matcher_total_records or known_total_records or 0
+                return
+            except InterruptedError:
+                cancelled_early = True
+                return
+            except Exception as e:
+                logging.warning(f"ISSM fast matcher FASTA mode failed. Falling back to Python matcher: {e}")
+                update_queue.put(("status_update", input_file, f"ISSM fast matcher failed. Falling back to Python matcher."))
+        
+        if not probe_items:
+            logging.info("Preparing Python probe variants for fallback/legacy FASTA matching.")
+            probe_items = prepare_probe_match_items(probes)
 
-        update_queue.put(("progress_max", input_file, total_records))
-        update_queue.put(("progress_update", input_file, 0))
-        update_queue.put(("status_update", input_file, f"Matching sequences (0/{total_records:,})"))
+        if sampling_percentage == 100:
+            set_busy_progress(
+                update_queue,
+                input_file,
+                "Counting sequences...",
+            )
+        
+            try:
+                total_records = get_total_reads_with_seqkit(
+                    file_to_use,
+                    analysis_cancelled
+                )
 
+            except InterruptedError:
+                cancelled_early = True
+                return
+
+            except Exception as e:
+                logging.warning(
+                    f"SeqKit FASTA count failed. Falling back to Python count: {e}"
+                )
+                update_queue.put((
+                    "status_update",
+                    input_file,
+                    "SeqKit count failed. Counting sequences with Python."
+                ))
+
+                total_records = 0
+                with open_sequence_text_stream(file_to_use) as handle:
+                    for _ in SeqIO.parse(handle, "fasta"):
+                        if analysis_cancelled.get("flag"):
+                            cancelled_early = True
+                            return
+                        total_records += 1
+
+        if total_records <= 0:
+            raise ValueError(f"❌ No valid sequences found in {input_file}")
+        
+        probe_names = np.array([name for name, _ in probes])
+        probe_dict = {name: seq for name, seq in probes}
+
+        BATCH_SIZE = 300
+
+        emit_percent_progress(
+            update_queue=update_queue,
+            input_file=input_file,
+            phase="Matching",
+            processed=0,
+            total=total_records,
+            unit="sequences",
+            reset=True,
+        )
+        
         probe_counts = Counter({name: 0 for name in probe_names})
         matched_sequences = set()
         read_to_probes = {}
         total_matched_sequences = 0
 
         cpu_count = os.cpu_count() or 1
-        num_workers = min(int(cpu_count * 0.75), 61)
+        num_workers = max(1, min(int(cpu_count * 0.75), 61))
         safe_cores = list(range(num_workers))
         
         with open(output_file_path, 'w', encoding="utf-8") as result_file:
@@ -666,68 +1650,185 @@ def FASTA_detect_and_quantify_probe_batched(
         fasta_fh = None
         written_reads = set()
 
-        with open(output_file_path, 'a', encoding="utf-8") as result_file, \
-             ProcessPoolExecutor(max_workers = num_workers, initializer=init_worker_all, initargs=(cached_sequences, safe_cores)) as executor:
+        last_progress_update = 0
+        progress_update_interval = max(
+            BATCH_SIZE,
+            total_records // 500,
+        )
+        completed_batches = set()
+        pending_futures = set()
+        max_in_flight = max(4, min(num_workers * 2, 64))
+        executor = None
 
-            futures = []
-            for batch_index, record_batch in enumerate(fasta_batch_generator(fasta_records, BATCH_SIZE), start=1):
-                if analysis_cancelled["flag"]:
-                    cancelled_early = True
-                    break
-                futures.append(executor.submit(match_batch_sequences, record_batch, probes, threshold, batch_index, cached_sequences))
+        try:
+            executor = ProcessPoolExecutor(
+                max_workers=num_workers,
+                initializer=init_worker_all,
+                initargs=(probe_items, safe_cores)
+            )
 
-            completed_batches = set()
-            
-            for future in as_completed(futures):
-                if analysis_cancelled["flag"]:
-                    cancelled_early = True
-                    break
-            
-                try:
-                    matches, batch_idx, batch_size = future.result()
-            
-                    if batch_idx not in completed_batches:
-                        processed_so_far += batch_size
-                        completed_batches.add(batch_idx)
-            
-                    for match in matches:
-                        read_id, probe_name, score_orig, score_rc, read_seq = match
-                        probe_counts[probe_name] += 1
-                        matched_sequences.add(read_id)
-                        read_to_probes.setdefault(read_id, set()).add(probe_name)
-                        result_file.write(f"{read_id}\t{probe_name}\t{score_orig}\t{score_rc}\n")
+            with open_sequence_text_stream(file_to_use) as fasta_handle, \
+                 open(output_file_path, 'a', encoding="utf-8") as result_file:
 
-                        if read_id not in written_reads:
-                            if fasta_fh is None:
-                                try:
-                                    fasta_fh = open(fasta_path, 'w', encoding="utf-8")
-                                except Exception as e:
-                                    logging.exception(f"Failed to open FASTA for writing: {fasta_path} — {e}")
-                                    fasta_fh = None
-                            if fasta_fh is not None:
-                                fasta_fh.write(f">{read_id}\n{read_seq}\n")
-                                written_reads.add(read_id)
+                batch_iterator = enumerate(
+                    fasta_batch_generator(fasta_handle, BATCH_SIZE),
+                    start=1
+                )
+                input_exhausted = False
 
-                    update_queue.put(("progress_update", input_file, processed_so_far))
-                    update_queue.put(("status_update", input_file, f"Matching sequences ({processed_so_far:,}/{total_records:,})"))
-            
-                except Exception as e:
-                    logging.exception(f"❌ Exception during FASTA batch processing: {e}")
-                    update_queue.put(("status_update", input_file, f"❌ Batch error: {e}"))
-                    
-            total_matched_sequences = len(matched_sequences)
-            
+                while pending_futures or not input_exhausted:
+                    if analysis_cancelled.get("flag"):
+                        cancelled_early = True
+                        update_queue.put((
+                            "status_update",
+                            input_file,
+                            "🛑 Cancelling..."
+                        ))
+                        break
+
+                    while (
+                        not input_exhausted
+                        and len(pending_futures) < max_in_flight
+                    ):
+                        try:
+                            batch_index, record_batch = next(batch_iterator)
+                        except StopIteration:
+                            input_exhausted = True
+                            break
+
+                        if analysis_cancelled.get("flag"):
+                            cancelled_early = True
+                            break
+
+                        pending_futures.add(
+                            executor.submit(
+                                match_batch_sequences,
+                                record_batch,
+                                threshold,
+                                batch_index
+                            )
+                        )
+
+                    if cancelled_early:
+                        break
+
+                    if not pending_futures:
+                        continue
+
+                    done, _ = wait(
+                        pending_futures,
+                        timeout=0.1,
+                        return_when=FIRST_COMPLETED
+                    )
+
+                    if not done:
+                        continue
+
+                    pending_futures.difference_update(done)
+
+                    for future in done:
+                        if analysis_cancelled.get("flag"):
+                            cancelled_early = True
+                            break
+
+                        try:
+                            matches, batch_idx, batch_size = future.result()
+                        except Exception as e:
+                            had_error = True
+                            logging.exception(
+                                f"❌ Exception during FASTA batch processing: {e}"
+                            )
+                            update_queue.put((
+                                "status_update",
+                                input_file,
+                                f"❌ Batch error: {e}"
+                            ))
+                            break
+
+                        if batch_idx not in completed_batches:
+                            processed_so_far += batch_size
+                            completed_batches.add(batch_idx)
+
+                        for match in matches:
+                            read_id, probe_name, score_orig, score_rc, read_seq = match
+                            probe_counts[probe_name] += 1
+                            matched_sequences.add(read_id)
+                            read_to_probes.setdefault(read_id, set()).add(probe_name)
+                            result_file.write(
+                                f"{read_id}\t{probe_name}\t{score_orig}\t{score_rc}\n"
+                            )
+
+                            if read_id not in written_reads:
+                                if fasta_fh is None:
+                                    try:
+                                        fasta_fh = open(
+                                            fasta_path,
+                                            "w",
+                                            encoding="utf-8"
+                                        )
+                                    except Exception as e:
+                                        logging.exception(
+                                            f"Failed to open FASTA for writing: "
+                                            f"{fasta_path} — {e}"
+                                        )
+                                        fasta_fh = None
+
+                                if fasta_fh is not None:
+                                    fasta_fh.write(f">{read_id}\n{read_seq}\n")
+                                    written_reads.add(read_id)
+
+                        if (
+                            processed_so_far - last_progress_update
+                            >= progress_update_interval
+                        ):
+                            emit_percent_progress(
+                                update_queue=update_queue,
+                                input_file=input_file,
+                                phase="Matching",
+                                processed=processed_so_far,
+                                total=total_records,
+                                unit="sequences",
+                            )
+                            last_progress_update = processed_so_far
+
+                    if cancelled_early or had_error:
+                        break
+
+        finally:
+            if executor is not None:
+                if (
+                    cancelled_early
+                    or had_error
+                    or analysis_cancelled.get("flag")
+                ):
+                    shutdown_process_pool_fast(
+                        executor,
+                        pending_futures
+                    )
+                else:
+                    executor.shutdown(wait=True)
+
             if fasta_fh is not None:
                 try:
                     fasta_fh.close()
                 except Exception:
                     pass
-                if len(written_reads) == 0 and os.path.exists(fasta_path):
-                    try:
-                        os.remove(fasta_path)
-                        logging.debug(f"No matched reads — removed empty FASTA: {fasta_path}")
-                    except Exception as e:
-                        logging.warning(f"Failed to remove empty FASTA ({fasta_path}): {e}")
+
+            if not written_reads and os.path.exists(fasta_path):
+                try:
+                    os.remove(fasta_path)
+                    logging.debug(
+                        f"No matched reads — removed empty FASTA: {fasta_path}"
+                    )
+                except Exception as e:
+                    logging.warning(
+                        f"Failed to remove empty FASTA ({fasta_path}): {e}"
+                    )
+
+        total_matched_sequences = len(matched_sequences)
+
+        if cancelled_early or analysis_cancelled.get("flag") or had_error:
+            return
 
         with open(output_file_path, 'r', encoding="utf-8") as f:
             lines = f.readlines()
@@ -782,46 +1883,159 @@ def FASTA_detect_and_quantify_probe_batched(
                 )
 
     except Exception as e:
+        had_error = True
+        completed_files["had_error"] = True
         logging.exception(f"❌ Error processing FASTA file: {e}")
         update_queue.put(("status_update", input_file, f"❌ Error: {e}"))
 
     finally:
+        if sampled_file and sampled_file != input_file and os.path.exists(sampled_file):
+            try:
+                os.remove(sampled_file)
+                logging.info(f"Successfully removed temporary FASTA file: {sampled_file}")
+            except Exception as e:
+                logging.warning(f"Failed to remove temporary FASTA file: {sampled_file}, reason: {e}")
+    
         with lock:
             completed_files['count'] += 1
+            is_last_file = completed_files.get('count', 0) >= total_files
 
-        update_queue.put(("progress_update", input_file, processed_so_far))
-        update_queue.put(("status_update", input_file, f"Matching sequences ({processed_so_far:,}/{total_records:,})"))
-        time.sleep(0.4)
-        
-        try_generate_plots_once(completed_files, lock, total_files, analysis_cancelled, results, output_dir_path, probes)
+        if (
+            total_records > 0
+            and not cancelled_early
+            and not analysis_cancelled.get("flag")
+            and not had_error
+        ):
+            processed_so_far = min(processed_so_far, total_records)
+            emit_percent_progress(
+                update_queue=update_queue,
+                input_file=input_file,
+                phase="Matching",
+                processed=processed_so_far,
+                total=total_records,
+                unit="sequences",
+            )
 
-        if cancelled_early or (analysis_cancelled["flag"] and processed_so_far < total_records):
+        if cancelled_early or analysis_cancelled.get("flag"):
+            completed_files["cancelled"] = True
             update_queue.put(("status_update", input_file, "🚫 Cancelled"))
+
+        elif had_error:
+            completed_files["had_error"] = True
+
         else:
+            if is_last_file:
+                update_queue.put(("status_update", input_file, "📊 Generating plots and summary..."))
+            try_generate_plots_once(
+                completed_files,
+                lock,
+                total_files,
+                analysis_cancelled,
+                results,
+                output_dir_path,
+                probes
+            )
             update_queue.put(("status_update", input_file, "✅ Completed"))
 
 def FASTQ_sampling(input_file, sampling_percentage, file_format, update_queue=None, min_reads=5000, analysis_cancelled=None):
     temp_output_file = None
 
     try:
-        base_filename = os.path.basename(input_file).replace(".gz", "").replace(".fastq", "").replace(".fasta", "").replace(".fa", "")
+        base_filename = (
+            os.path.basename(input_file)
+            .replace(".gz", "")
+            .replace(".fastq", "")
+            .replace(".fq", "")
+            .replace(".fasta", "")
+            .replace(".fa", "")
+        )
         unique_id = uuid.uuid4().hex[:8]
-        temp_output_file = os.path.join(tempfile.gettempdir(), f"tmp_{base_filename}_{unique_id}.fastq.gz")
+        temp_output_file = os.path.join(
+            tempfile.gettempdir(),
+            f"tmp_{base_filename}_{unique_id}.fastq.gz"
+        )
 
         def open_text_stream(file_path):
-            return io.TextIOWrapper(gzip.open(file_path, "rb"), encoding="utf-8") if file_path.endswith(".gz") else open(file_path, "rt", encoding="utf-8")
+            if file_path.endswith(".gz"):
+                return io.TextIOWrapper(gzip.open(file_path, "rb"), encoding="utf-8")
+            return open(file_path, "rt", encoding="utf-8")
 
         if analysis_cancelled and analysis_cancelled.get("flag"):
-            raise InterruptedError("Sampling cancelled before starting")
+            raise InterruptedError("Sampling cancelled before starting.")
 
         if input_file.endswith(".gz") and not validate_gzip_file(input_file):
             raise ValueError(f"Invalid gzip file: {input_file}")
 
+        try:
+            set_busy_progress(
+                update_queue,
+                input_file,
+                "Counting reads..."
+            )
+            
+            total_reads = get_total_reads_with_seqkit(input_file, analysis_cancelled)
+
+            sample_size = max(int(total_reads * (sampling_percentage / 100)), min_reads)
+            sample_size = min(sample_size, total_reads)
+
+            if sample_size <= 0:
+                raise ValueError(f"No reads available for sampling: {input_file}")
+
+            set_busy_progress(
+                update_queue,
+                input_file,
+                f"Sampling {sample_size:,} reads..."
+            )
+
+            if analysis_cancelled and analysis_cancelled.get("flag"):
+                raise InterruptedError("Sampling cancelled before SeqKit sampling.")
+
+            run_seqkit_sample2(input_file, temp_output_file, sample_size, analysis_cancelled)
+
+            if analysis_cancelled and analysis_cancelled.get("flag"):
+                raise InterruptedError("Sampling cancelled after SeqKit sampling.")
+
+            if not os.path.exists(temp_output_file) or os.path.getsize(temp_output_file) == 0:
+                raise ValueError("SeqKit sampling produced an empty output file.")
+
+            if update_queue:
+                update_queue.put((
+                    "status_update",
+                    input_file,
+                    "Sampling completed. Preparing matching...",
+                ))
+
+
+            logging.info(f"✅ SeqKit sampling completed: {sample_size} reads → {temp_output_file}")
+
+            return temp_output_file, sample_size
+
+        except FileNotFoundError:
+            logging.warning("SeqKit not found. Falling back to Python sampling.")
+            if update_queue:
+                update_queue.put(("status_update", input_file, "SeqKit not found. Using standard Python sampling."))
+
+        except InterruptedError:
+            raise
+
+        except subprocess.CalledProcessError as e:
+            logging.warning(f"SeqKit sampling failed. Falling back to Python sampling: {e.stderr}")
+            if update_queue:
+                update_queue.put(("status_update", input_file, "SeqKit failed. Using standard Python sampling."))
+
+        except Exception as e:
+            logging.warning(f"Unexpected SeqKit sampling error. Falling back to Python sampling: {e}")
+            if update_queue:
+                update_queue.put(("status_update", input_file, "SeqKit error. Using standard Python sampling."))
+
         if file_format == "fastq":
             validate_fastq_format(input_file)
 
-        if update_queue:
-            update_queue.put(("status_update", input_file, "Ready to sampling"))
+        set_busy_progress(
+            update_queue,
+            input_file,
+            "Counting reads..."
+        )
 
         total_reads = 0
         with open_text_stream(input_file) as handle:
@@ -833,10 +2047,14 @@ def FASTQ_sampling(input_file, sampling_percentage, file_format, update_queue=No
         sample_size = max(int(total_reads * (sampling_percentage / 100)), min_reads)
         sample_size = min(sample_size, total_reads)
 
-        if update_queue:
-            update_queue.put(("status_update", input_file, f"Sampling {sample_size:,} reads..."))
-            update_queue.put(("progress_max", input_file, sample_size))
-            update_queue.put(("progress_update", input_file, 0))
+        if sample_size <= 0:
+            raise ValueError(f"No reads available for sampling: {input_file}")
+
+        set_busy_progress(
+            update_queue,
+            input_file,
+            f"Sampling {sample_size:,} reads..."
+        )
 
         selected_indices = set(sorted(random.sample(range(total_reads), sample_size)))
         sampled_count = 0
@@ -845,50 +2063,59 @@ def FASTQ_sampling(input_file, sampling_percentage, file_format, update_queue=No
             for i, record in enumerate(SeqIO.parse(handle, file_format)):
                 if analysis_cancelled and analysis_cancelled.get("flag"):
                     raise InterruptedError("Sampling cancelled during writing.")
+
                 if i in selected_indices:
                     SeqIO.write(record, output_handle, file_format)
                     sampled_count += 1
-                    if update_queue and sampled_count % 10000 == 0:
-                        update_queue.put(("progress_update", input_file, sampled_count))
 
         if update_queue:
-            update_queue.put(("progress_update", input_file, sample_size))
-            update_queue.put(("status_update", input_file, "✅ Sampling completed"))
+            update_queue.put((
+                "status_update",
+                input_file,
+                "Sampling completed. Preparing matching...",
+            ))
+            
+        logging.info(f"✅ Python sampling completed: {sample_size} reads → {temp_output_file}")
 
-        logging.info(f"✅ Sampling completed: {sample_size} reads → {temp_output_file}")
-        return temp_output_file, total_reads
+        return temp_output_file, sample_size
 
     except InterruptedError:
         if temp_output_file and os.path.exists(temp_output_file):
             try:
                 os.remove(temp_output_file)
-                logging.warning(f"🛑 Sampling cancelled. Temp file removed: {temp_output_file}")
+                logging.warning(f"🛑 FASTQ sampling cancelled. Temp file removed: {temp_output_file}")
             except Exception as e:
-                logging.warning(f"⚠️ Failed to remove temp file during cancel: {e}")
+                logging.warning(f"⚠️ Failed to remove FASTQ temp file during cancel: {e}")
+
         if update_queue:
             update_queue.put(("status_update", input_file, "🚫 Cancelled"))
+
         return None, None
 
     except Exception as e:
         if temp_output_file and os.path.exists(temp_output_file):
             try:
                 os.remove(temp_output_file)
-                logging.info(f"🧹 Removed temp file after sampling error: {temp_output_file}")
+                logging.info(f"🧹 Removed FASTQ temp file after sampling error: {temp_output_file}")
             except Exception as err:
-                logging.warning(f"⚠️ Failed to remove temp file after error: {err}")
+                logging.warning(f"⚠️ Failed to remove FASTQ temp file after error: {err}")
 
-        logging.error(f"❌ Error during sampling: {e}")
+        logging.error(f"❌ Error during FASTQ sampling: {e}")
+
         if update_queue:
             if analysis_cancelled and analysis_cancelled.get("flag"):
                 update_queue.put(("status_update", input_file, "🚫 Cancelled"))
             else:
                 update_queue.put(("status_update", input_file, f"❌ Error: {e}"))
+
         return None, None
 
 def FASTQ_detect_and_quantify_probe(
-    input_file, probes, threshold, sampling_percentage, output_file_path,
+    input_file, probes, probe_items, threshold, sampling_percentage, output_file_path,
     completed_files, total_files,
-    summary_file_path, cached_sequences, results, output_dir_path, analysis_cancelled, update_queue
+    summary_file_path, results, output_dir_path, analysis_cancelled, update_queue,
+    matcher_threads=None,
+    matching_method="fast_biological"
 ):
     def batch_generator(handle, batch_size):
         batch = []
@@ -900,9 +2127,12 @@ def FASTQ_detect_and_quantify_probe(
         if batch:
             yield batch
 
-    processed_so_far = 0  
+    processed_so_far = 0
     cancelled_early = False
     sampled_file = None
+    sampled_count = None
+    total_records = 0
+    had_error = False
 
     try:
         BATCH_SIZE = 500
@@ -911,27 +2141,117 @@ def FASTQ_detect_and_quantify_probe(
         file_format = "fastq"
 
         file_to_use = input_file
+        
         if sampling_percentage != 100:
-            sampled_file, _ = FASTQ_sampling(
+            sampled_file, sampled_count = FASTQ_sampling(
                 input_file, sampling_percentage, file_format,
                 update_queue, 5000, analysis_cancelled
             )
             
-            if analysis_cancelled["flag"] or not sampled_file:
-                update_queue.put(("status_update", input_file, "🚫 Cancelled"))
+            if not sampled_file:
+                if analysis_cancelled.get("flag"):
+                    cancelled_early = True
+                    update_queue.put((
+                        "status_update",
+                        input_file,
+                        "🚫 Cancelled"
+                    ))
+                else:
+                    had_error = True
+                    completed_files["had_error"] = True
+            
+                return
+        
+            file_to_use = sampled_file
+            total_records = sampled_count
+        
+
+        if should_use_issm_matcher(threshold, sampling_percentage, matching_method):
+            known_total_records = (
+                total_records
+                if total_records and total_records > 0
+                else 0
+            )
+            try:
+                _, matcher_total_records, _ = run_issm_matcher_exact_and_update(
+                    input_file=original_filename,
+                    matcher_input_file=file_to_use,
+                    probes=probes,
+                    total_records=known_total_records,
+                    output_file_path=output_file_path,
+                    output_dir_path=output_dir_path,
+                    summary_file_path=summary_file_path,
+                    results=results,
+                    selected_format="fastq",
+                    original_filename=original_filename,
+                    start_time=start_time,
+                    analysis_cancelled=analysis_cancelled,
+                    update_queue=update_queue,
+                    matcher_threads=matcher_threads,
+                    threshold=threshold,
+                    matching_method=matching_method,
+                )
+                processed_so_far = matcher_total_records or 0
+                return
+            except InterruptedError:
                 cancelled_early = True
                 return
-            file_to_use = sampled_file
+            except Exception as e:
+                logging.warning(f"ISSM fast matcher FASTQ mode failed. Falling back to Python matcher: {e}")
+                update_queue.put(("status_update", input_file, f"ISSM fast matcher failed. Falling back to Python matcher."))
 
+        if not probe_items:
+            logging.info("Preparing Python probe variants for fallback/legacy FASTQ matching.")
+            probe_items = prepare_probe_match_items(probes)
 
-        update_queue.put(("status_update", input_file, "🔍 Counting reads..."))
+        if sampling_percentage == 100:
+            set_busy_progress(
+                update_queue,
+                input_file,
+                "Counting reads...",
+            )
+                
+            try:
+                total_records = get_total_reads_with_seqkit(
+                    file_to_use,
+                    analysis_cancelled
+                )
 
-        with gzip.open(file_to_use, "rt") if file_to_use.endswith(".gz") else open(file_to_use, "rt") as handle:
-            total_records = sum(1 for _ in SeqIO.parse(handle, "fastq"))
+            except InterruptedError:
+                cancelled_early = True
+                return
 
-        update_queue.put(("progress_max", input_file, total_records))
-        update_queue.put(("progress_update", input_file, 0))
-        update_queue.put(("status_update", input_file, f"Matching reads (0/{total_records:,})"))
+            except Exception as e:
+                logging.warning(
+                    f"SeqKit count failed. Falling back to Python count: {e}"
+                )
+                update_queue.put((
+                    "status_update",
+                    input_file,
+                    "SeqKit count failed. Counting reads with Python."
+                ))
+
+                total_records = 0
+                open_func = gzip.open if file_to_use.endswith(".gz") else open
+                with open_func(file_to_use, "rt") as handle:
+                    for _ in SeqIO.parse(handle, "fastq"):
+                        if analysis_cancelled.get("flag"):
+                            cancelled_early = True
+                            return
+                        total_records += 1
+
+        if total_records <= 0:
+            raise ValueError(f"❌ No valid reads found in {input_file}")
+
+        emit_percent_progress(
+            update_queue=update_queue,
+            input_file=input_file,
+            phase="Matching",
+            processed=0,
+            total=total_records,
+            unit="reads",
+            reset=True,
+        )
 
         probe_counts = Counter({name: 0 for name, _ in probes})
         matched_reads = set()
@@ -939,9 +2259,7 @@ def FASTQ_detect_and_quantify_probe(
         probe_dict = {name: seq for name, seq in probes}
         total_matched_reads = 0
         cpu_count = os.cpu_count() or 1
-        num_workers = min(int(cpu_count * 0.75), 61)
-        futures_queue = queue.Queue()
-
+        num_workers = max(1, min(int(cpu_count * 0.75), 61))
         fasta_path = os.path.join(
             output_dir_path,
             f"{os.path.splitext(os.path.basename(input_file))[0]}_matched_reads.fasta"
@@ -961,71 +2279,174 @@ def FASTQ_detect_and_quantify_probe(
             result_file.write("\nMatched Reads Information\n")
             result_file.write("Read ID\tProbe Name\tScore Original\tScore Reverse Complement\n")
 
-        with gzip.open(file_to_use, "rt") if file_to_use.endswith(".gz") else open(file_to_use, "rt") as handle, \
-             open(output_file_path, 'a', encoding="utf-8") as result_file, \
-             ProcessPoolExecutor(max_workers=num_workers, initializer=init_worker, initargs=(cached_sequences,)) as executor:
+        last_progress_update = 0
+        progress_update_interval = max(
+            10000,
+            total_records // 500,
+        )
+        completed_batches = set()
+        pending_futures = set()
+        max_in_flight = max(4, min(num_workers * 2, 64))
+        executor = None
 
-            def submit_batches():
-                for batch_index, record_batch in enumerate(batch_generator(handle, BATCH_SIZE), 1):
-                    if analysis_cancelled["flag"]:
-                        logging.info(f"🛑 Skipping batch submit due to cancellation: {input_file}")
+        try:
+            executor = ProcessPoolExecutor(
+                max_workers=num_workers,
+                initializer=init_worker,
+                initargs=(probe_items,)
+            )
+
+            open_func = gzip.open if file_to_use.endswith(".gz") else open
+            with open_func(file_to_use, "rt") as handle, \
+                 open(output_file_path, 'a', encoding="utf-8") as result_file:
+
+                batch_iterator = enumerate(
+                    batch_generator(handle, BATCH_SIZE),
+                    start=1
+                )
+                input_exhausted = False
+
+                while pending_futures or not input_exhausted:
+                    if analysis_cancelled.get("flag"):
+                        cancelled_early = True
+                        update_queue.put((
+                            "status_update",
+                            input_file,
+                            "🛑 Cancelling..."
+                        ))
                         break
-                    future = executor.submit(match_batch_reads, record_batch, probes, threshold, batch_index)
-                    futures_queue.put(future)
 
-            submit_thread = threading.Thread(target=submit_batches)
-            submit_thread.start()
+                    while (
+                        not input_exhausted
+                        and len(pending_futures) < max_in_flight
+                    ):
+                        try:
+                            batch_index, record_batch = next(batch_iterator)
+                        except StopIteration:
+                            input_exhausted = True
+                            break
 
-            last_progress_update = 0
-            completed_batches = set()
-            
-            while submit_thread.is_alive() or not futures_queue.empty():
-                if analysis_cancelled["flag"]:
-                    cancelled_early = True
-                    logging.info(f"🛑 Cancelled during processing loop: {input_file}")
-                    break                
+                        if analysis_cancelled.get("flag"):
+                            cancelled_early = True
+                            break
+
+                        pending_futures.add(
+                            executor.submit(
+                                match_batch_reads,
+                                record_batch,
+                                threshold,
+                                batch_index
+                            )
+                        )
+
+                    if cancelled_early:
+                        break
+
+                    if not pending_futures:
+                        continue
+
+                    done, _ = wait(
+                        pending_futures,
+                        timeout=0.1,
+                        return_when=FIRST_COMPLETED
+                    )
+
+                    if not done:
+                        continue
+
+                    pending_futures.difference_update(done)
+
+                    for future in done:
+                        if analysis_cancelled.get("flag"):
+                            cancelled_early = True
+                            break
+
+                        try:
+                            matches, batch_idx, batch_size = future.result()
+                        except Exception as e:
+                            had_error = True
+                            logging.exception(
+                                f"❌ Exception during FASTQ batch processing: {e}"
+                            )
+                            update_queue.put((
+                                "status_update",
+                                input_file,
+                                f"❌ Batch error: {e}"
+                            ))
+                            break
+
+                        if batch_idx not in completed_batches:
+                            processed_so_far += batch_size
+                            completed_batches.add(batch_idx)
+
+                        for match in matches:
+                            read_id, probe_name, score_orig, score_rc, read_seq = match
+                            probe_counts[probe_name] += 1
+                            matched_reads.add(read_id)
+                            read_to_probes.setdefault(read_id, set()).add(probe_name)
+                            result_file.write(
+                                f"{read_id}\t{probe_name}\t{score_orig}\t{score_rc}\n"
+                            )
+
+                            if read_id not in written_reads:
+                                if fasta_fh is None:
+                                    try:
+                                        fasta_fh = open(
+                                            fasta_path,
+                                            "w",
+                                            encoding="utf-8"
+                                        )
+                                    except Exception as e:
+                                        logging.exception(
+                                            f"Failed to open FASTA for writing: "
+                                            f"{fasta_path} — {e}"
+                                        )
+                                        fasta_fh = None
+
+                                if fasta_fh is not None:
+                                    fasta_fh.write(f">{read_id}\n{read_seq}\n")
+                                    written_reads.add(read_id)
+
+                        if (
+                            processed_so_far - last_progress_update
+                            >= progress_update_interval
+                        ):
+                            emit_percent_progress(
+                                update_queue=update_queue,
+                                input_file=input_file,
+                                phase="Matching",
+                                processed=processed_so_far,
+                                total=total_records,
+                                unit="reads",
+                            )
+                            last_progress_update = processed_so_far
+
+                    if cancelled_early or had_error:
+                        break
+
+        finally:
+            if executor is not None:
+                if (
+                    cancelled_early
+                    or had_error
+                    or analysis_cancelled.get("flag")
+                ):
+                    shutdown_process_pool_fast(
+                        executor,
+                        pending_futures
+                    )
+                else:
+                    executor.shutdown(wait=True)
+
+        total_matched_reads = len(matched_reads)
+
+        if cancelled_early or analysis_cancelled.get("flag") or had_error:
+            if fasta_fh is not None:
                 try:
-                    future = futures_queue.get(timeout=0.2)
-                    matches, batch_idx, batch_size = future.result()
-            
-                    if batch_idx not in completed_batches:
-                        processed_so_far += batch_size
-                        completed_batches.add(batch_idx)
-            
-                    for match in matches:
-                        read_id, probe_name, score_orig, score_rc, read_seq = match
-                        probe_counts[probe_name] += 1
-                        matched_reads.add(read_id)
-                        read_to_probes.setdefault(read_id, set()).add(probe_name)
-                        result_file.write(f"{read_id}\t{probe_name}\t{score_orig}\t{score_rc}\n")
-                        
-                        if read_id not in written_reads:
-                            if fasta_fh is None:
-                                try:
-                                    fasta_fh = open(fasta_path, "w", encoding="utf-8")
-                                except Exception as e:
-                                    logging.exception(f"Failed to open FASTA for writing: {fasta_path} — {e}")
-                                    fasta_fh = None
-                            if fasta_fh is not None:
-                                fasta_fh.write(f">{read_id}\n{read_seq}\n")
-                                written_reads.add(read_id)
-                        
-                    if processed_so_far - last_progress_update >= 10000:
-                        update_queue.put(("progress_update", input_file, processed_so_far))
-                        update_queue.put(("status_update", input_file, f"Matching reads ({processed_so_far:,}/{total_records:,})"))
-
-                        last_progress_update = processed_so_far
-            
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    logging.exception(f"❌ Exception during FASTQ batch processing: {e}")
-                    update_queue.put(("status_update", input_file, f"❌ Batch error: {e}"))
-
-
-            submit_thread.join()
-            
-            total_matched_reads = len(matched_reads)
+                    fasta_fh.close()
+                except Exception:
+                    pass
+            return
 
         if fasta_fh is not None:
             try:
@@ -1106,31 +2527,60 @@ def FASTQ_detect_and_quantify_probe(
                 results["probe_results"].setdefault(probe_name, {})[original_filename] = count
 
     except Exception as e:
+        had_error = True
+        completed_files["had_error"] = True
         logging.exception(f"❌ Error processing file {input_file}: {e}")
         update_queue.put(("status_update", input_file, f"❌ Error: {e}"))
 
     finally:
-        if sampled_file and sampling_percentage < 100:
+        if sampled_file and sampled_file != input_file and os.path.exists(sampled_file):
             try:
                 os.remove(sampled_file)
                 logging.warning(f"Successfully remove temp file: {sampled_file}")
             except Exception as e:
                 logging.warning(f"🧹 Failed to remove temp file: {sampled_file}, reason: {e}")
 
-        completed_files['count'] += 1
+        with lock:
+            completed_files['count'] += 1
+            is_last_file = completed_files.get('count', 0) >= total_files
     
-        processed_so_far = min(processed_so_far, total_records)
-        update_queue.put(("progress_update", input_file, processed_so_far))
-        update_queue.put(("status_update", input_file, f"Matching reads ({processed_so_far:,}/{total_records:,})"))
-        time.sleep(0.4)
-        
-        try_generate_plots_once(completed_files, lock, total_files, analysis_cancelled, results, output_dir_path, probes)
-    
-        if cancelled_early or (analysis_cancelled["flag"] and processed_so_far < total_records):
+        if (
+            total_records > 0
+            and not cancelled_early
+            and not analysis_cancelled.get("flag")
+            and not had_error
+        ):
+            processed_so_far = min(processed_so_far, total_records)
+            emit_percent_progress(
+                update_queue=update_queue,
+                input_file=input_file,
+                phase="Matching",
+                processed=processed_so_far,
+                total=total_records,
+                unit="reads",
+            )
+
+        if cancelled_early or analysis_cancelled.get("flag"):
+            completed_files["cancelled"] = True
             update_queue.put(("status_update", input_file, "🚫 Cancelled"))
+
+        elif had_error:
+            completed_files["had_error"] = True
+
         else:
+            if is_last_file:
+                update_queue.put(("status_update", input_file, "📊 Generating plots and summary..."))
+            try_generate_plots_once(
+                completed_files,
+                lock,
+                total_files,
+                analysis_cancelled,
+                results,
+                output_dir_path,
+                probes
+            )
             update_queue.put(("status_update", input_file, "✅ Completed"))
-        
+       
 def sanitize_filename(filename):
     return re.sub(r'[<>:"/\\|?*]', '_', filename)
 
@@ -1169,7 +2619,6 @@ def plot_probe_results(probe_name, file_counts, output_dir):
     logging.info(f"Plot saved: {plot_path}")
 
 def plot_fastq_results(file_name, probe_counts, output_dir):
-    import matplotlib.pyplot as plt
     file_name_only = os.path.basename(file_name) 
 
     filtered_counts = {sanitize_filename(k): v for k, v in probe_counts.items() if k != "sampled_records"}
@@ -1239,7 +2688,7 @@ def generate_heatmap(file_path):
 
         sns.heatmap(
             heatmap_data,
-            cmap="coolwarm",
+            cmap="Blues",
             annot=False,
             linewidths=0.5,
             cbar=True,
@@ -1269,20 +2718,30 @@ def generate_heatmap(file_path):
 
 def try_generate_plots_once(completed_files, lock, total_files, analysis_cancelled, results, output_dir_path, probes):
     with lock:
-        if (
-            completed_files['count'] == total_files and
-            not completed_files.get("plotted", False)
-        ):
-            completed_files["plotted"] = True
+        if completed_files.get("plotted", False):
+            return
 
-            if analysis_cancelled["flag"]:
-                logging.warning("⚠️ Plot generation skipped due to user cancellation.")
-                return
+        if completed_files.get("count", 0) < total_files:
+            return
 
-            logging.info("📊 Generating plots and heatmaps...")
-            generate_all_plots(results, output_dir_path)
-            generate_combined_results(output_dir_path, probes, results)
-            logging.info("✅ Plots and heatmaps generated successfully!")
+        completed_files["plotted"] = True
+
+    if analysis_cancelled.get("flag") or completed_files.get("cancelled", False):
+        logging.warning("⚠️ Plot generation skipped because analysis was cancelled.")
+        return
+
+    if completed_files.get("had_error", False):
+        logging.warning("⚠️ Plot generation skipped because one or more files failed.")
+        return
+
+    if not results.get("file_results") or not results.get("probe_results"):
+        logging.warning("⚠️ Plot generation skipped because there are no complete results.")
+        return
+
+    logging.info("📊 Generating plots and heatmaps...")
+    generate_all_plots(results, output_dir_path)
+    generate_combined_results(output_dir_path, probes, results)
+    logging.info("✅ Plots and heatmaps generated successfully!")
 
 class ProgressUpdateWorker(QThread):
     progress_signal = Signal(str, str, str)
@@ -1313,8 +2772,8 @@ class CustomProgressDialog(QDialog):
         self.update_queue = update_queue
         self.analysis_cancelled = analysis_cancelled
         self.setWindowTitle("Processing files")
-        self.setMinimumSize(800, 600)
-        self.resize(800, 600)
+        self.setMinimumSize(950, 600)
+        self.resize(950, 600)
         self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint)
 
         self.file_bars = {}
@@ -1325,6 +2784,7 @@ class CustomProgressDialog(QDialog):
         self.total_count = len(file_list)
         self._updated_files = set()
         self._completion_shown = False
+        self._error_files = set()
 
         self.completed_label = QLabel(f"Completed: 0 / {self.total_count}")
         self.completed_label.setStyleSheet("font-size: 12px; color: #555;")
@@ -1388,10 +2848,10 @@ class CustomProgressDialog(QDialog):
         """)
         self.tree.header().setStretchLastSection(False)
         self.tree.header().setSectionResizeMode(0, QHeaderView.Fixed)
-        self.tree.header().resizeSection(0, 250)
-        self.tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.tree.header().setSectionResizeMode(2, QHeaderView.Fixed)
-        self.tree.header().resizeSection(2, 250)
+        self.tree.header().resizeSection(0, 300)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.tree.header().resizeSection(1, 260)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.Stretch)
 
         for filepath in file_list:
             filename = os.path.basename(filepath)
@@ -1493,15 +2953,27 @@ class CustomProgressDialog(QDialog):
         self.analysis_cancelled["flag"] = True
         self.update_status_all("🛑 Cancelling... Please wait.")
         
-    def show_completion_message(self, cancelled=False):
+    def show_completion_message(
+        self,
+        cancelled=False,
+        had_error=False
+    ):
         if self._completion_shown:
-            return 
+            return
+    
         self._completion_shown = True
-
+    
         if cancelled:
-            CustomMessageBox("🚫 Analysis was cancelled by user.", self).exec_()
+            message = "🚫 Analysis was cancelled by user."
+        elif had_error:
+            message = (
+                "⚠️ Analysis finished, but one or more files "
+                "could not be processed."
+            )
         else:
-            CustomMessageBox("✅ All tasks are completed!", self).exec_()
+            message = "✅ All tasks are completed!"
+    
+        CustomMessageBox(message, self).exec_()
         self.close()
 
     @Slot(str, str, str)
@@ -1516,20 +2988,44 @@ class CustomProgressDialog(QDialog):
             if file_key in self.file_bars:
                 self.file_bars[file_key].setMaximum(int(float(value)))
 
-        elif key == 'status_update':
+        elif key == "status_update":
             if file_key in self.file_labels:
                 item = self.file_labels[file_key]
                 item.setText(2, value)
+                item.setToolTip(2, value)
         
-                if value.strip() in ("✅ Completed", "🚫 Cancelled"):
+                status = value.strip()
+        
+                if status.startswith("❌ Error") or status.startswith("❌ Batch error"):
+                    self._error_files.add(file_key)
+        
+                terminal_statuses = {
+                    "✅ Completed",
+                    "🚫 Cancelled",
+                }
+        
+                is_terminal_status = (
+                    status in terminal_statuses
+                    or status.startswith("❌ Error")
+                    or status.startswith("❌ Batch error")
+                )
+        
+                if is_terminal_status:
                     if file_key not in self._updated_files:
                         self._updated_files.add(file_key)
                         self.completed_count = len(self._updated_files)
-                        self.completed_label.setText(f"Completed: {self.completed_count} / {self.total_count}")
+        
+                        self.completed_label.setText(
+                            f"Completed: "
+                            f"{self.completed_count} / {self.total_count}"
+                        )
         
                         if self.completed_count == self.total_count:
-                            self.show_completion_message(cancelled=self.analysis_cancelled["flag"])
-    
+                            self.show_completion_message(
+                                cancelled=self.analysis_cancelled["flag"],
+                                had_error=bool(self._error_files)
+                            )
+                    
 class CustomMessageBox(QDialog):
     def __init__(self, message, parent=None):
         super().__init__(parent)
@@ -1631,7 +3127,315 @@ class CustomConfirmBox(QDialog):
         if self.on_close:
             self.on_close()
         super().accept()
-       
+
+class SamplingPolicyDialog(QDialog):
+    def __init__(self, sampling, parent=None):
+        super().__init__(parent)
+
+        self.choice = None
+        self.sampling = float(sampling)
+
+        self.setWindowTitle("Intermediate Sampling Ratio")
+        self.setWindowFlags(
+            Qt.Dialog
+            | Qt.WindowTitleHint
+            | Qt.CustomizeWindowHint
+        )
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setModal(True)
+        self.setFixedWidth(570)
+
+        self.setStyleSheet("""
+            SamplingPolicyDialog {
+                background-color: #F9FAFA;
+            }
+
+            QLabel#titleLabel {
+                color: #2C3E50;
+                font-size: 15px;
+                font-weight: bold;
+            }
+
+            QLabel#messageLabel {
+                color: #2C3E50;
+                font-size: 13px;
+            }
+
+            QLabel#recommendationLabel {
+                color: #555555;
+                font-size: 12px;
+                background-color: white;
+                border: 1px solid #D8DEE3;
+                border-radius: 6px;
+                padding: 10px;
+            }
+
+            QPushButton {
+                min-height: 30px;
+                padding: 5px 12px;
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+
+            QPushButton#primaryButton {
+                background-color: #1D83D5;
+                color: white;
+                border: none;
+            }
+
+            QPushButton#primaryButton:hover {
+                background-color: #1565C0;
+            }
+
+            QPushButton#secondaryButton {
+                background-color: #5F6B73;
+                color: white;
+                border: none;
+            }
+
+            QPushButton#secondaryButton:hover {
+                background-color: #465159;
+            }
+
+            QPushButton#advancedButton {
+                background-color: #F39C12;
+                color: white;
+                border: none;
+            }
+
+            QPushButton#advancedButton:hover {
+                background-color: #D68910;
+            }
+
+            QPushButton#cancelButton {
+                background-color: white;
+                color: #555555;
+                border: 1px solid #AEB6BF;
+            }
+
+            QPushButton#cancelButton:hover {
+                background-color: #ECEFF1;
+            }
+        """)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(22, 18, 22, 18)
+        main_layout.setSpacing(12)
+
+        title_label = QLabel("⚠️ Intermediate sampling ratio")
+        title_label.setObjectName("titleLabel")
+        title_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(title_label)
+
+        message_label = QLabel(
+            f"The selected sampling ratio is {self.sampling:g}%.\n"
+            "Sampling ratios between 51% and 99% are not recommended"
+        )
+        message_label.setObjectName("messageLabel")
+        message_label.setAlignment(Qt.AlignCenter)
+        message_label.setWordWrap(True)
+        main_layout.addWidget(message_label)
+
+        recommendation_label = QLabel(
+            "Strict sampling must first determine the exact read count \n"
+            "and may be slower than 100% full extraction.\n\n"
+            "Recommended settings:\n"
+            "• 1–50% for subset screening\n"
+            "• 100% for full extraction"
+        )
+        recommendation_label.setObjectName("recommendationLabel")
+        recommendation_label.setWordWrap(True)
+        main_layout.addWidget(recommendation_label)
+
+        instruction_label = QLabel("Choose how to proceed.")
+        instruction_label.setObjectName("messageLabel")
+        instruction_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(instruction_label)
+
+        recommended_layout = QHBoxLayout()
+        recommended_layout.setSpacing(8)
+
+        use_100_btn = QPushButton("Use 100%")
+        use_100_btn.setObjectName("primaryButton")
+        use_100_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        use_100_btn.setDefault(True)
+        use_100_btn.clicked.connect(
+            lambda: self._select_choice("use_100")
+        )
+
+        use_50_btn = QPushButton("Use 50%")
+        use_50_btn.setObjectName("secondaryButton")
+        use_50_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        use_50_btn.clicked.connect(
+            lambda: self._select_choice("use_50")
+        )
+
+        recommended_layout.addStretch()
+        recommended_layout.addWidget(use_100_btn)
+        recommended_layout.addWidget(use_50_btn)
+        recommended_layout.addStretch()
+
+        main_layout.addLayout(recommended_layout)
+
+        lower_layout = QHBoxLayout()
+        lower_layout.setSpacing(8)
+
+        advanced_btn = QPushButton(
+            f"Continue with {self.sampling:g}%"
+        )
+        advanced_btn.setObjectName("advancedButton")
+        advanced_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        advanced_btn.clicked.connect(
+            lambda: self._select_choice("continue")
+        )
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("cancelButton")
+        cancel_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        cancel_btn.clicked.connect(self.reject)
+
+        lower_layout.addStretch()
+        lower_layout.addWidget(advanced_btn)
+        lower_layout.addWidget(cancel_btn)
+        lower_layout.addStretch()
+
+        main_layout.addLayout(lower_layout)
+
+        self.adjustSize()
+
+    def _select_choice(self, choice):
+        self.choice = choice
+        self.accept()
+
+    def showEvent(self, event):
+        self.raise_()
+        self.activateWindow()
+        QApplication.alert(self, 3000)
+        super().showEvent(event)    
+
+class CustomAlertBox(QDialog):
+    def __init__(
+        self,
+        title,
+        message,
+        parent=None,
+        alert_type="warning"
+    ):
+        super().__init__(parent)
+
+        self.setWindowTitle(title)
+        self.setWindowFlags(
+            Qt.Dialog
+            | Qt.WindowTitleHint
+            | Qt.CustomizeWindowHint
+        )
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setModal(True)
+        self.setMinimumWidth(380)
+        self.setMaximumWidth(600)
+
+        alert_settings = {
+            "warning": {
+                "icon": "⚠️",
+                "title_color": "#D98200",
+            },
+            "error": {
+                "icon": "❌",
+                "title_color": "#C62828",
+            },
+            "information": {
+                "icon": "ℹ️",
+                "title_color": "#1D83D5",
+            },
+        }
+
+        settings = alert_settings.get(
+            alert_type,
+            alert_settings["warning"]
+        )
+
+        self.setStyleSheet("""
+            CustomAlertBox {
+                background-color: #F9FAFA;
+            }
+
+            QLabel#alertTitle {
+                font-size: 15px;
+                font-weight: bold;
+            }
+
+            QLabel#alertMessage {
+                color: #2C3E50;
+                font-size: 13px;
+                background-color: white;
+                border: 1px solid #D8DEE3;
+                border-radius: 6px;
+                padding: 12px;
+            }
+
+            QPushButton {
+                background-color: #1D83D5;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 20px;
+                font-size: 12px;
+                font-weight: bold;
+                min-width: 70px;
+                min-height: 28px;
+            }
+
+            QPushButton:hover {
+                background-color: #306999;
+            }
+        """)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(22, 18, 22, 18)
+        main_layout.setSpacing(12)
+
+        title_label = QLabel(
+            f"{settings['icon']} {title}"
+        )
+        title_label.setObjectName("alertTitle")
+        title_label.setStyleSheet(
+            f"color: {settings['title_color']};"
+        )
+        title_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(title_label)
+
+        message_label = QLabel(message)
+        message_label.setObjectName("alertMessage")
+        message_label.setWordWrap(True)
+        message_label.setTextInteractionFlags(
+            Qt.TextSelectableByMouse
+        )
+        main_layout.addWidget(message_label)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        ok_button = QPushButton("OK")
+        ok_button.setCursor(
+            QCursor(Qt.CursorShape.PointingHandCursor)
+        )
+        ok_button.setDefault(True)
+        ok_button.clicked.connect(self.accept)
+
+        button_layout.addWidget(ok_button)
+        button_layout.addStretch()
+
+        main_layout.addLayout(button_layout)
+
+        self.adjustSize()
+
+    def showEvent(self, event):
+        self.raise_()
+        self.activateWindow()
+        QApplication.alert(self, 3000)
+        super().showEvent(event)
+
 class SequenceMiningGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1643,6 +3447,7 @@ class SequenceMiningGUI(QMainWindow):
 
         self.ui = Ui_In_silico_sequence_mining()
         self.ui.setupUi(self)
+        self.setup_matching_method_controls()
 
         self.file_paths = {}
         self.selected_file_paths = {}
@@ -1654,15 +3459,167 @@ class SequenceMiningGUI(QMainWindow):
         self.set_file_format("fastq")
         self.ui.radioButton.setChecked(True)
 
-        self.ui.parallelProcessing.setVisible(False)
-        self.ui.label_10.setVisible(False)
+        try:
+            self.ui.threasholdtextEdit.textChanged.connect(lambda *_: self.update_matching_method_controls_state())
+        except Exception:
+            pass
+        
+    def _show_alert(
+        self,
+        title,
+        message,
+        alert_type="warning"
+    ):
+        CustomAlertBox(
+            title=title,
+            message=message,
+            parent=self,
+            alert_type=alert_type
+        ).exec()
+        
+    def setup_matching_method_controls(self):
+        self._compact_exact_window_height = 620
+        self._expanded_method_window_height = 760
+        try:
+            self.resize(1200, self._compact_exact_window_height)
+            if hasattr(self.ui, "centralwidget"):
+                self.ui.centralwidget.setMinimumHeight(600)
+        except Exception:
+            pass
 
-        self.ui.parallelProcessingCheckbox.stateChanged.connect(self.toggle_parallel_controls)
+        self.matchingMethodFrame = QFrame(self.ui.centralwidget)
+        self.matchingMethodFrame.setObjectName("matchingMethodFrame")
+        self.matchingMethodFrame.setGeometry(QRect(630, 590, 531, 130))
+        self.matchingMethodFrame.setFrameShape(QFrame.Shape.StyledPanel)
+        self.matchingMethodFrame.setStyleSheet("QFrame#matchingMethodFrame{background-color:#F8FAFC;border:1px solid #D8DEE9;border-radius:6px;}")
 
-    def toggle_parallel_controls(self, state):
-        is_checked = bool(state)
-        self.ui.parallelProcessing.setVisible(is_checked)
-        self.ui.label_10.setVisible(is_checked)
+        self.matchingMethodTitle = QLabel("Matching method (Threshold < 100 only)", self.matchingMethodFrame)
+        self.matchingMethodTitle.setGeometry(QRect(12, 6, 420, 18))
+        self.matchingMethodTitle.setStyleSheet("font-weight:bold;color:#2c3e50;")
+
+        self.exactModeNotice = QLabel(
+            "Threshold 100: exact matching is used automatically; method selection is ignored.",
+            self.matchingMethodFrame
+        )
+        self.exactModeNotice.setGeometry(QRect(12, 25, 500, 17))
+        self.exactModeNotice.setStyleSheet("font-size:10px;color:#1565C0;")
+        self.exactModeNotice.setToolTip(
+            "When threshold is 100%, ISSM always uses exact matching.\n"
+            "Fast/Legacy method choice only affects threshold values below 100%."
+        )
+
+        self.fastBiologicalRadioButton = QRadioButton("Fast biological matching (Recommended, faster)", self.matchingMethodFrame)
+        self.fastBiologicalRadioButton.setGeometry(QRect(12, 48, 300, 20))
+        self.fastBiologicalRadioButton.setChecked(True)
+        self.fastBiologicalRadioButton.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.fastBiologicalRadioButton.setToolTip(
+            "Uses probe-length percent identity and allowed mismatches.\n"
+            "Threshold means matched bp percentage across the probe length.\n"
+            "Example: 20 bp at 95% allows up to 1 mismatch."
+        )
+
+        self.legacyFuzzyRadioButton = QRadioButton("Legacy fuzzy matching (Slower, compatibility mode)", self.matchingMethodFrame)
+        self.legacyFuzzyRadioButton.setGeometry(QRect(12, 92, 330, 20))
+        self.legacyFuzzyRadioButton.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.legacyFuzzyRadioButton.setToolTip(
+            "Uses the original RapidFuzz partial-ratio score.\n"
+            "Threshold means fuzzy string similarity score, not matched bp percentage.\n"
+            "Use this only when reproducing previous ISSM fuzzy results."
+        )
+
+        self.fastBiologicalDescription = QLabel(
+            "Threshold = probe-length percent identity / allowed mismatches.",
+            self.matchingMethodFrame
+        )
+        self.fastBiologicalDescription.setGeometry(QRect(32, 68, 480, 17))
+        self.fastBiologicalDescription.setStyleSheet("font-size:10px;color:#455A64;")
+
+        self.legacyFuzzyDescription = QLabel(
+            "Threshold = RapidFuzz partial-ratio score, not exact matched-bp percentage.",
+            self.matchingMethodFrame
+        )
+        self.legacyFuzzyDescription.setGeometry(QRect(32, 112, 485, 17))
+        self.legacyFuzzyDescription.setStyleSheet("font-size:10px;color:#455A64;")
+
+        self.matchingMethodFrame.raise_()
+        self.matchingMethodFrame.setVisible(False)
+        self.update_matching_method_controls_state()
+
+    def update_matching_method_controls_state(self):
+        try:
+            threshold = float(
+                self.ui.threasholdtextEdit.value()
+            )
+        except Exception:
+            threshold = None
+    
+        show_method_controls = (
+            threshold is not None
+            and threshold < 100
+        )
+    
+        self.matchingMethodFrame.setVisible(
+            show_method_controls
+        )
+    
+        self.adjust_window_height_for_matching_method(
+            show_method_controls
+        )
+    
+        if not show_method_controls:
+            self.fastBiologicalRadioButton.setChecked(True)
+            self.fastBiologicalRadioButton.setEnabled(False)
+            self.legacyFuzzyRadioButton.setEnabled(False)
+            return
+    
+        self.fastBiologicalRadioButton.setEnabled(True)
+        self.legacyFuzzyRadioButton.setEnabled(True)
+    
+        self.exactModeNotice.setText(
+            "Threshold < 100: choose percent-identity "
+            "matching or legacy fuzzy score."
+        )
+
+    def adjust_window_height_for_matching_method(self, show_method_controls):
+        try:
+            target_height = (
+                self._expanded_method_window_height
+                if show_method_controls
+                else self._compact_exact_window_height
+            )
+            central_min_height = 740 if show_method_controls else 600
+
+            if hasattr(self.ui, "centralwidget"):
+                self.ui.centralwidget.setMinimumHeight(central_min_height)
+                self.ui.centralwidget.setMaximumHeight(16777215)
+
+            self.setMinimumHeight(target_height)
+            self.setMaximumHeight(16777215)
+
+            if not self.isMaximized() and not self.isFullScreen():
+                self._force_window_height(target_height)
+                QTimer.singleShot(0, lambda h=target_height: self._force_window_height(h))
+                QTimer.singleShot(80, lambda h=target_height: self._force_window_height(h))
+        except Exception:
+            pass
+
+    def _force_window_height(self, target_height):
+        try:
+            if self.isMaximized() or self.isFullScreen():
+                return
+            current_width = max(self.width(), 1200)
+
+            self.setMinimumHeight(target_height)
+            self.setMaximumHeight(target_height)
+            self.resize(current_width, target_height)
+            self.setMaximumHeight(16777215)
+        except Exception:
+            pass
+
+    def get_matching_method(self):
+        if getattr(self, "legacyFuzzyRadioButton", None) and self.legacyFuzzyRadioButton.isChecked():
+            return "legacy_fuzzy"
+        return "fast_biological"
 
     def connect_signals(self):
         self.ui.radioButton.toggled.connect(lambda: self.set_file_format("fastq"))
@@ -1732,66 +3689,129 @@ class SequenceMiningGUI(QMainWindow):
         self.ui.startAnalysisButton.setText("Start Analysis")
 
 
+    def _resolve_sampling_policy(self, sampling):
+        if 0 < sampling <= 50 or sampling == 100:
+            return sampling, True
+    
+        if 50 < sampling < 100:
+            dialog = SamplingPolicyDialog(
+                sampling=sampling,
+                parent=self
+            )
+            dialog.exec()
+    
+            if dialog.choice == "use_100":
+                self.ui.percentagetextEdit.setValue(100.0)
+                return 100.0, True
+    
+            if dialog.choice == "use_50":
+                self.ui.percentagetextEdit.setValue(50.0)
+                return 50.0, True
+    
+            if dialog.choice == "continue":
+                return sampling, True
+    
+            return sampling, False
+    
+        return sampling, True
+
     def start_analysis(self):
         probe_text = self.ui.probeTextEdit.toPlainText().strip()
-        threshold_str = self.ui.threasholdtextEdit.text().strip()
-        percentage_str = self.ui.percentagetextEdit.text().strip()
         output_dir = self.ui.outputPathLineEdit.text().strip()
-        use_parallel = self.ui.parallelProcessingCheckbox.isChecked()
-        parallel_workers = int(self.ui.parallelProcessing.value())
         file_format = "fastq" if self.ui.radioButton.isChecked() else "fasta"
+        matching_method = self.get_matching_method()
     
         selected_files = list(self.selected_file_paths.values())
     
         if not selected_files:
-            QMessageBox.warning(self, "Warning", "No files selected!")
+            self._show_alert(
+                "Input Required",
+                "No files have been selected.\n\nPlease select at least one FASTQ or FASTA file."
+            )
             return
-    
+        
         if not probe_text:
-            QMessageBox.warning(self, "Warning", "Please enter probe sequences.")
-            return
-    
-        is_valid, invalid_bases = validate_probes_before_analysis(probe_text)
-        if not is_valid:
-            QMessageBox.warning(
-                self,
-                "Invalid Base or Format Found",
-                "The following invalid bases or formatting errors were found in probe sequences:\n"
-                f"{', '.join(invalid_bases)}\n\n"
-                "Please correct them before continuing. Analysis will be aborted."
+            self._show_alert(
+                "Probe Required",
+                "Please enter at least one probe sequence before starting the analysis."
             )
             return
     
-        if not threshold_str:
-            QMessageBox.warning(self, "Warning", "Threshold is required.")
+        is_valid, invalid_bases = validate_probes_before_analysis(
+            probe_text
+        )
+        
+        if not is_valid:
+            error_details = "\n".join(
+                f"• {item}"
+                for item in sorted(invalid_bases)
+            )
+        
+            self._show_alert(
+                title="Invalid Probe Format",
+                message=(
+                    "The following probe sequence errors were found:\n\n"
+                    f"{error_details}\n\n"
+                    "Please correct the probe input before continuing."
+                ),
+                alert_type="error"
+            )
             return
+
         try:
-            threshold = int(threshold_str)
-        except ValueError:
+            threshold = int(round(float(self.ui.threasholdtextEdit.value())))
+        except Exception:
             QMessageBox.warning(self, "Warning", "Threshold must be an integer.")
             return
-    
-        if not percentage_str:
-            QMessageBox.warning(self, "Warning", "Sampling percentage is required.")
-            return
+
         try:
-            sampling = float(percentage_str)
-            if not (0 <= sampling <= 100):
-                QMessageBox.warning(self, "Warning", "Sampling percentage must be within 0–100.")
-                return
-        except ValueError:
-            QMessageBox.warning(self, "Warning", "Sampling percentage must be numeric.")
+            sampling = float(
+                self.ui.percentagetextEdit.value()
+            )
+        except Exception:
+            self._show_alert(
+                title="Invalid Sampling Percentage",
+                message=(
+                    "The sampling percentage must be a valid number."
+                ),
+                alert_type="error"
+            )
+            return
+        
+        if not (0 < sampling <= 100):
+            self._show_alert(
+                title="Invalid Sampling Percentage",
+                message=(
+                    "The sampling percentage must be greater than 0 "
+                    "and less than or equal to 100."
+                ),
+                alert_type="error"
+            )
+            return
+
+        sampling, sampling_ok = self._resolve_sampling_policy(sampling)
+        if not sampling_ok:
             return
     
         if not output_dir:
-            QMessageBox.warning(self, "Warning", "Please select an output directory.")
+            self._show_alert(
+                title="Output Directory Required",
+                message=(
+                    "No output directory has been selected.\n\n"
+                    "Please select a folder in which to save the results."
+                )
+            )
             return
+        
         if not os.path.isdir(output_dir):
-            QMessageBox.warning(self, "Warning", f"Output directory does not exist: {output_dir}")
-            return
-    
-        if use_parallel and parallel_workers < 1:
-            QMessageBox.warning(self, "Warning", "When parallel processing is enabled, workers must be ≥ 1.")
+            self._show_alert(
+                title="Invalid Output Directory",
+                message=(
+                    "The selected output directory does not exist:\n\n"
+                    f"{output_dir}"
+                ),
+                alert_type="error"
+            )
             return
     
         self.analysis_cancelled["flag"] = False
@@ -1830,8 +3850,7 @@ class SequenceMiningGUI(QMainWindow):
                 file_format,          
                 self.analysis_cancelled,
                 self.update_queue,
-                use_parallel,
-                parallel_workers
+                matching_method
             ),
             daemon=True
         ).start()

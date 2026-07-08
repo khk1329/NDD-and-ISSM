@@ -144,7 +144,7 @@ class DownloadStatusWindow(QWidget):
         self.tree.headerItem().setTextAlignment(1, Qt.AlignCenter)
         self.tree.headerItem().setTextAlignment(2, Qt.AlignCenter)
         self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Run Accession", "Progress", "Status"])
+        self.tree.setHeaderLabels(["Run Accession", "Activity", "Status"])
         self.tree.setRootIsDecorated(False)
         self.tree.setSelectionMode(QTreeWidget.NoSelection)
         self.tree.setFocusPolicy(Qt.NoFocus)
@@ -206,8 +206,12 @@ class DownloadStatusWindow(QWidget):
             item.setTextAlignment(0, Qt.AlignCenter)
 
             bar = QProgressBar()
+            
+            bar.setRange(0, 1)
             bar.setValue(0)
-            bar.setMaximum(100)
+            
+            bar.setTextVisible(False)
+            
             bar.setFixedHeight(16)
             bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             bar.setStyleSheet("""
@@ -215,10 +219,8 @@ class DownloadStatusWindow(QWidget):
                     background-color: #E4E8EB;
                     border: none;
                     border-radius: 4px;
-                    text-align: center;
-                    font-size: 11px;
-                    color: white;
                 }
+            
                 QProgressBar::chunk {
                     background-color: #1D83D5;
                     border-radius: 4px;
@@ -267,17 +269,51 @@ class DownloadStatusWindow(QWidget):
         try:
             while True:
                 data = self.progress_queue.get_nowait()
+    
                 acc = data.get("acc")
-                status = data.get("status")
-                progress = data.get("progress")
-
+                status = data.get("status", "")
+    
                 if acc in self.status_labels:
                     self.status_labels[acc].setText(2, status)
-                if acc in self.status_bars:
-                    self.status_bars[acc].setValue(progress)
+    
+                bar = self.status_bars.get(acc)
+                if bar is None:
+                    continue
+    
+                normalized_status = status.lower()
+    
+                if "completed" in normalized_status:
+                    bar.setRange(0, 1)
+                    bar.setValue(1)
+    
+                elif (
+                    "canceling" in normalized_status
+                    or "canceled" in normalized_status
+                    or "cancelled" in normalized_status
+                ):
+                    bar.setRange(0, 1)
+                    bar.setValue(0)
+    
+                elif (
+                    "error" in normalized_status
+                    or "failed" in normalized_status
+                    or "not found" in normalized_status
+                    or "not available" in normalized_status
+                    or "insufficient" in normalized_status
+                ):
+                    bar.setRange(0, 1)
+                    bar.setValue(0)
+    
+                elif "waiting" in normalized_status:
+                    bar.setRange(0, 1)
+                    bar.setValue(0)
+
+                else:
+                    bar.setRange(0, 0)
+    
         except Empty:
             pass
-
+    
     def start_downloads(self):
         self.max_concurrent = 4
         self.pending_queue = []
@@ -301,26 +337,46 @@ class DownloadStatusWindow(QWidget):
                     progress_queue=self.progress_queue
                 )
     
-            worker.error.connect(lambda message, acc=acc: self.handle_worker_error(acc, message))
-            worker.done.connect(lambda acc=acc: self.mark_worker_finished(acc))
-            worker.done.connect(self.on_worker_done)
+            worker.error.connect(
+                lambda message, acc=acc: self.handle_worker_error(acc, message)
+            )
+            
+            worker.finished.connect(
+                partial(
+                    self.on_worker_thread_finished,
+                    worker,
+                    acc
+                )
+            )
     
             self.pending_queue.append(worker)
     
         self.start_next_batch()
 
     def start_next_batch(self):
-        while len(self.active_workers) < self.max_concurrent and self.pending_queue:
+        if self._canceled:
+            return
+    
+        while (
+            len(self.active_workers) < self.max_concurrent
+            and self.pending_queue
+        ):
             worker = self.pending_queue.pop(0)
             self.active_workers.append(worker)
             worker.start()
 
-    def on_worker_done(self):
-        self.active_workers = [w for w in self.active_workers if w.isRunning()]
-        self.start_next_batch()
+    def on_worker_thread_finished(self, worker, acc):
+        if worker in self.active_workers:
+            self.active_workers.remove(worker)
+    
+        self.mark_worker_finished(acc)
+    
+        if not self._canceled:
+            self.start_next_batch()
 
     def handle_worker_error(self, acc, message, *args):
-        self.failed_files.append(acc)
+        if acc not in self.failed_files:
+            self.failed_files.append(acc)
     
         if self.progress_queue:
             self.progress_queue.put({
@@ -328,33 +384,50 @@ class DownloadStatusWindow(QWidget):
                 "status": message,
                 "progress": 0
             })
-    
-        self.mark_worker_finished(acc)
-        self.on_worker_done()
         
     def mark_worker_finished(self, acc, *_):
-        self.completed_count += 1
-        self.completed_label.setText(f"Completed: {self.completed_count} / {self.total_count}  ")
+        if acc in self._updated_files:
+            return
     
-        if self.completed_count == self.total_count and not self._completion_shown:
+        self._updated_files.add(acc)
+    
+        self.completed_count = len(self._updated_files)
+    
+        self.completed_label.setText(
+            f"Completed: {self.completed_count} / {self.total_count}  "
+        )
+    
+        if (
+            self.completed_count == self.total_count
+            and not self._completion_shown
+        ):
             self._completion_shown = True
+    
             if self.start_button:
                 self.start_button.setEnabled(True)
     
             if self._canceled:
                 msg = "🛑 Download process was canceled."
+    
             elif self.failed_files:
-                failed_list = ", ".join(self.failed_files)
-                msg = f"❌ Some files failed to download:\n{failed_list}"
+                msg = "❌ Some files failed to download."
+    
             else:
                 msg = "✅ All files downloaded successfully."
     
-            msg_box = CustomMessageBox(title="Download Summary", message=msg, parent=self)
-            msg_box.setWindowFlags(msg_box.windowFlags() | Qt.WindowStaysOnTopHint)
+            msg_box = CustomMessageBox(
+                title="Download Summary",
+                message=msg,
+                parent=self
+            )
+            msg_box.setWindowFlags(
+                msg_box.windowFlags()
+                | Qt.WindowStaysOnTopHint
+            )
             msg_box.exec()
     
             self.force_close()
-            
+                
     def handle_close(self):
         confirm = CustomConfirmBox(
             title="Cancel Downloads",
@@ -370,15 +443,35 @@ class DownloadStatusWindow(QWidget):
         
         for worker in self.active_workers:
             worker.stop()
-            
+        
+            acc = worker.run_acc
+        
+            if acc in self.status_labels:
+                self.status_labels[acc].setText(
+                    2,
+                    "Canceling..."
+                )
+        
+            if acc in self.status_bars:
+                bar = self.status_bars[acc]
+                bar.setRange(0, 1)
+                bar.setValue(0)
+        
             if self.progress_queue:
                 self.progress_queue.put({
-                    "acc": worker.run_acc,
+                    "acc": acc,
                     "status": "Canceling...",
                     "progress": 0
                 })
                 
         for worker in self.pending_queue:
+            acc = worker.run_acc
+            
+            if acc in self.status_bars:
+                bar = self.status_bars[acc]
+                bar.setRange(0, 1)
+                bar.setValue(0)            
+            
             if self.progress_queue:
                 self.progress_queue.put({
                     "acc": worker.run_acc,
@@ -399,6 +492,9 @@ class DownloadStatusWindow(QWidget):
         else:
             self.handle_close()
             event.ignore()
+
+class SraDownloadCancelled(Exception):
+    pass
                            
 class SraDownloadWorker(QThread):
     progress = Signal(int)
@@ -412,15 +508,234 @@ class SraDownloadWorker(QThread):
         self.metadata = metadata
         self.output_dir = output_dir
         self.selected_format = selected_format
-        self.progress_queue = progress_queue 
+        self.progress_queue = progress_queue        
         self.success = False
-        self._stopped = False 
-        self._output_created = False
-        self._created_out_dir = None
         
+        self._stopped = False
+        
+        self._stop_event = threading.Event()
+        
+        self._process_lock = threading.Lock()
+        self._active_process = None
+        
+        self._working_dir = None
+
+    def _cleanup_working_dir(self):
+        working_dir = self._working_dir
+        self._working_dir = None
+    
+        if not working_dir or not os.path.exists(working_dir):
+            return
+    
+        def handle_remove_error(func, path, exc_info):
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+            except Exception:
+                pass
+    
+        for _ in range(3):
+            try:
+                shutil.rmtree(
+                    working_dir,
+                    onerror=handle_remove_error
+                )
+                break
+    
+            except PermissionError:
+                time.sleep(0.1)
+    
+            except FileNotFoundError:
+                break
+    
+            except Exception:
+                break
+            
+    def _commit_working_dir(self, final_output_dir):
+        self._raise_if_cancelled()
+    
+        if not self._working_dir:
+            raise RuntimeError(
+                "SRA working directory is not available."
+            )
+    
+        backup_dir = None
+    
+        if os.path.exists(final_output_dir):
+            backup_dir = (
+                f"{final_output_dir}.backup_"
+                f"{int(time.time() * 1000)}"
+            )
+    
+            os.replace(
+                final_output_dir,
+                backup_dir
+            )
+    
+        try:
+            os.replace(
+                self._working_dir,
+                final_output_dir
+            )
+    
+            self._working_dir = None
+    
+        except Exception:
+            if (
+                backup_dir
+                and os.path.exists(backup_dir)
+                and not os.path.exists(final_output_dir)
+            ):
+                os.replace(
+                    backup_dir,
+                    final_output_dir
+                )
+    
+            raise
+    
+        else:
+            if backup_dir and os.path.exists(backup_dir):
+                shutil.rmtree(
+                    backup_dir,
+                    ignore_errors=True
+                )
+
     def stop(self):
+        if self._stop_event.is_set():
+            return
+    
         self._stopped = True
+        self._stop_event.set()
+    
+        with self._process_lock:
+            process = self._active_process
+    
+        self._terminate_process_tree(process)
         
+    def _cancel_requested(self):
+        return self._stop_event.is_set()
+    
+    def _raise_if_cancelled(self):
+        if self._cancel_requested():
+            raise SraDownloadCancelled()
+
+    def _set_active_process(self, process):
+        with self._process_lock:
+            self._active_process = process
+    
+    def _clear_active_process(self, process=None):
+        with self._process_lock:
+            if (
+                process is None
+                or self._active_process is process
+            ):
+                self._active_process = None
+
+    def _terminate_process_tree(self, process):
+        if process is None:
+            return
+    
+        try:
+            if process.poll() is not None:
+                return
+    
+            if os.name == "nt":
+                subprocess.run(
+                    [
+                        "taskkill",
+                        "/PID",
+                        str(process.pid),
+                        "/T",
+                        "/F"
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False
+                )
+            else:
+                process.terminate()
+    
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+    
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    def _run_command_cancelable(self, command):
+        self._raise_if_cancelled()
+    
+        process = None
+    
+        try:
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+    
+            self._set_active_process(process)
+    
+            while True:
+                return_code = process.poll()
+    
+                if return_code is not None:
+                    return return_code == 0
+    
+                if self._cancel_requested():
+                    self._terminate_process_tree(process)
+                    raise SraDownloadCancelled()
+    
+                time.sleep(0.2)
+    
+        finally:
+            self._clear_active_process(process)
+    
+            if process is not None and process.poll() is None:
+                self._terminate_process_tree(process)
+
+    def _compress_fastq_cancelable(self, source_path, destination_path):
+        try:
+            with open(source_path, "rb") as source_file:
+                with gzip.open(destination_path, "wb") as gzip_file:
+    
+                    while True:
+                        self._raise_if_cancelled()
+    
+                        chunk = source_file.read(
+                            1024 * 1024
+                        )
+    
+                        if not chunk:
+                            break
+    
+                        gzip_file.write(chunk)
+    
+            self._raise_if_cancelled()
+    
+        except SraDownloadCancelled:
+            try:
+                if os.path.exists(destination_path):
+                    os.remove(destination_path)
+            except Exception:
+                pass
+    
+            raise
+    
+        except Exception:
+            try:
+                if os.path.exists(destination_path):
+                    os.remove(destination_path)
+            except Exception:
+                pass
+    
+            raise
+
     def _put_progress(self, status, progress):
         if self.progress_queue:
             self.progress_queue.put({
@@ -434,18 +749,6 @@ class SraDownloadWorker(QThread):
         if temp_sra_root and os.path.exists(temp_sra_root): shutil.rmtree(temp_sra_root, ignore_errors=True)
         if run_tmp and os.path.exists(run_tmp): shutil.rmtree(run_tmp, ignore_errors=True)
 
-    def _cleanup_out_dir_if_created(self):
-        if not self._output_created or not self._created_out_dir:
-            return
-        try:
-            if os.path.isdir(self._created_out_dir):
-                shutil.rmtree(self._created_out_dir, ignore_errors=True)
-        except Exception:
-            pass
-        finally:
-            self._output_created = False
-            self._created_out_dir = None
-
     def run(self):
         temp_path = None
         temp_sra_root = None
@@ -458,9 +761,7 @@ class SraDownloadWorker(QThread):
         elapsed_str = None
         
         try:
-            if self._stopped:
-                self._put_progress("❌ Canceled", 0)
-                return
+            self._raise_if_cancelled()
             est_mb = _parse_mb_from_metadata(self.metadata)
             est_sra_bytes = int((est_mb if est_mb else 2048) * 1024**2)
 
@@ -509,16 +810,35 @@ class SraDownloadWorker(QThread):
             temp_sra_root = os.path.join("C:/NDD_dummy_file", self.run_acc)
             os.makedirs(temp_sra_root, exist_ok=True)
     
-            prefetch_worker = PrefetchWorker(
-                run_acc_list=[self.run_acc],
-                prefetch_output_dir=temp_sra_root,
-                max_workers=1
-            )
-            prefetch_worker.run()
+            self._raise_if_cancelled()
             
-            if self._stopped:
-                self._put_progress("❌ Canceled", 0)
+            safe_temp_sra_root = os.path.normpath(
+                temp_sra_root
+            )
+            
+            prefetch_cmd = (
+                f'prefetch "{self.run_acc}" '
+                f'--output-directory "{safe_temp_sra_root}" '
+                f'--max-size 500G'
+            )
+            
+            prefetch_success = self._run_command_cancelable(
+                prefetch_cmd
+            )
+            
+            self._raise_if_cancelled()
+            
+            if not prefetch_success:
+                self._put_progress(
+                    "❌ Prefetch failed",
+                    0
+                )
+                self.error.emit(
+                    f"Prefetch failed for {self.run_acc}"
+                )
                 return
+            
+            self._raise_if_cancelled()
     
             candidate_paths = [
                 os.path.join(temp_sra_root, self.run_acc, f"{self.run_acc}.sra"),
@@ -526,10 +846,8 @@ class SraDownloadWorker(QThread):
             ]
             sra_path = next((p for p in candidate_paths if os.path.exists(p)), None)
 
-            if self._stopped:
-                self._put_progress("❌ Canceled", 0)
-                return
-
+            self._raise_if_cancelled()
+            
             if not sra_path:
                 self._put_progress("❌ .sra file not found", 0)
                 self.error.emit(f".sra file not found for {self.run_acc}")
@@ -555,10 +873,24 @@ class SraDownloadWorker(QThread):
             
             self._put_progress("Downloading...", 50)
     
-            out_dir = os.path.join(self.output_dir, self.run_acc)
-            os.makedirs(out_dir, exist_ok=True)
-            self._output_created = True
-            self._created_out_dir = out_dir
+            final_output_dir = os.path.abspath(
+                os.path.join(
+                    self.output_dir,
+                    self.run_acc
+                )
+            )
+            
+            os.makedirs(
+                os.path.abspath(self.output_dir),
+                exist_ok=True
+            )
+            
+            self._working_dir = tempfile.mkdtemp(
+                prefix=f".{self.run_acc}.partial_",
+                dir=os.path.abspath(self.output_dir)
+            )
+            
+            out_dir = self._working_dir
     
             if self.selected_format.upper() == "FASTA":
                 cmd = f'fastq-dump "{sra_path}" --outdir "{out_dir}" --split-files --fasta 0'
@@ -567,43 +899,145 @@ class SraDownloadWorker(QThread):
                 cmd = f'fasterq-dump "{sra_path}" -O "{out_dir}" --split-files --temp "{temp_path}"'
                 fallback_cmd = f'fastq-dump "{sra_path}" -O "{out_dir}" --split-files --gzip'
                 
-            runner = ConversionRunner()
-            runner.log.connect(lambda msg: self.status.emit(msg))
-            
             retry_limit = 3
+            self.success = False
+            
             for attempt in range(1, retry_limit + 1):
-                self.success = runner.run(cmd, fallback_cmd)
-                if self.success:
+                self._raise_if_cancelled()
+            
+                self._put_progress(
+                    f"Converting {self.run_acc} "
+                    f"(Attempt {attempt}/{retry_limit})...",
+                    0
+                )
+            
+                primary_success = self._run_command_cancelable(
+                    cmd
+                )
+            
+                self._raise_if_cancelled()
+            
+                if primary_success:
+                    self.success = True
                     break
-                else:
-                    self.status.emit(f"🔁 Retry {attempt} failed for {self.run_acc}")
-                    time.sleep(3)
+            
+                if fallback_cmd:
+                    self._put_progress(
+                        f"Primary conversion failed. "
+                        f"Trying fallback for {self.run_acc}...",
+                        0
+                    )
+            
+                    fallback_success = self._run_command_cancelable(
+                        fallback_cmd
+                    )
+            
+                    self._raise_if_cancelled()
+            
+                    if fallback_success:
+                        self.success = True
+                        break
+            
+                if attempt < retry_limit:
+                    self._put_progress(
+                        f"Conversion failed. Retrying "
+                        f"{self.run_acc} "
+                        f"({attempt + 1}/{retry_limit})...",
+                        0
+                    )
+            
+                    if self._stop_event.wait(3):
+                        raise SraDownloadCancelled()
 
-            if self._stopped:
-                self._put_progress("❌ Canceled", 0)
-                self._cleanup_out_dir_if_created()
-                return
+            self._raise_if_cancelled()
             
             if not self.success:
                 self._put_progress("❌ Conversion failed", 0)
                 self.error.emit(f"Conversion failed for {self.run_acc}")
                 return
     
-            if self.selected_format.upper() == "FASTQ" and "fasterq-dump" in cmd:
-                for fname in os.listdir(out_dir):
-                    
-                    if self._stopped:
+            if (
+                self.selected_format.upper() == "FASTQ"
+                and "fasterq-dump" in cmd
+            ):
+                fastq_files = [
+                    file_name
+                    for file_name in os.listdir(out_dir)
+                    if file_name.endswith(".fastq")
+                ]
+            
+                for file_name in fastq_files:
+                    self._raise_if_cancelled()
+            
+                    source_path = os.path.join(
+                        out_dir,
+                        file_name
+                    )
+            
+                    destination_path = (
+                        source_path + ".gz"
+                    )
+            
+                    self._put_progress(
+                        f"Compressing {file_name}...",
+                        0
+                    )
+            
+                    try:
+                        self._compress_fastq_cancelable(
+                            source_path,
+                            destination_path
+                        )
+            
+                    except SraDownloadCancelled:
+                        raise
+            
+                    except Exception as e:
+                        self._put_progress(
+                            f"❌ Compression failed: {file_name}",
+                            0
+                        )
+            
+                        self.error.emit(
+                            f"Compression failed for "
+                            f"{file_name}: {e}"
+                        )
+            
+                        self.success = False
                         return
-                    
-                    if fname.endswith(".fastq"):
-                        try:
-                            src = os.path.join(out_dir, fname)
-                            dst = os.path.join(out_dir, fname + ".gz")
-                            with open(src, "rb") as f_in, gzip.open(dst, "wb") as f_out:
-                                shutil.copyfileobj(f_in, f_out)
-                            os.remove(src)
-                        except Exception as e:
-                            self.status.emit(f"Compression error: {e}")
+            
+                    self._raise_if_cancelled()
+            
+                    try:
+                        os.remove(source_path)
+            
+                    except Exception as e:
+                        self._put_progress(
+                            f"❌ Failed to remove uncompressed file: "
+                            f"{file_name}",
+                            0
+                        )
+            
+                        self.error.emit(
+                            f"Failed to remove uncompressed "
+                            f"FASTQ file {file_name}: {e}"
+                        )
+            
+                        self.success = False
+                        return
+
+            self._raise_if_cancelled()
+            
+            self._put_progress(
+                "Finalizing download...",
+                0
+            )
+            
+            self._commit_working_dir(
+                final_output_dir
+            )
+            
+            out_dir = final_output_dir
 
             end_dt = datetime.now()
             end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -619,45 +1053,128 @@ class SraDownloadWorker(QThread):
                     end_time=end_str
                 )
             except Exception as e:
-                print(f"[WARN] log_metadata failed for {self.run_acc}: {e}")
-    
-            if self._stopped:
-                self._put_progress("❌ Canceled", 0)
-                self._cleanup_out_dir_if_created()
-                return
-
-            self._put_progress("✅ Download Completed", 100)
+                print(
+                    f"[WARN] log_metadata failed "
+                    f"for {self.run_acc}: {e}"
+                )
+            
+            self.success = True
+            self._put_progress(
+                "✅ Download Completed",
+                100
+            )
             self.progress.emit(1)
     
+        except SraDownloadCancelled:
+            self.success = False
+        
+            self._put_progress(
+                "🛑 Canceled",
+                0
+            )
+        
+            self._cleanup_working_dir()
+        
         except Exception as e:
-            self._put_progress(f"❌ Error: {e}", 0)
-            self._cleanup_out_dir_if_created()
+            self.success = False
+            self._put_progress(
+                f"❌ Error: {e}",
+                0
+            )
+        
+            self._cleanup_working_dir()
             self.error.emit(str(e))
             
         finally:
-            self.cleanup_temp_files(temp_path, temp_sra_root, run_tmp)
+            self._cleanup_working_dir()
+        
+            self.cleanup_temp_files(
+                temp_path,
+                temp_sra_root,
+                run_tmp
+            )
+        
             self.done.emit(self.run_acc)
-            
+
+class EnaDownloadCancelled(Exception):
+    pass
+        
 class EnaDownloadWorker(QThread):
     progress = Signal(int)
     status = Signal(str)
     error = Signal(str)
     done = Signal(str)
     
-    def __init__(self, run_acc, metadata, output_dir, progress_queue=None):
+    def __init__(
+        self,
+        run_acc,
+        metadata,
+        output_dir,
+        progress_queue=None
+    ):
         super().__init__()
+    
         self.run_acc = run_acc
         self.metadata = metadata
         self.output_dir = output_dir
         self.progress_queue = progress_queue
+    
         self._stopped = False
+        self._stop_event = threading.Event()
+        self._network_lock = threading.Lock()
+        self._active_response = None
+        self._session = None
+    
         self.success = False
         self._emitted_done = False
-        self._output_created = False
-        self._created_dir = None 
+        self._working_dir = None
 
     def stop(self):
+        if self._stop_event.is_set():
+            return
+    
         self._stopped = True
+        self._stop_event.set()
+    
+        with self._network_lock:
+            response = self._active_response
+            session = self._session
+    
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+    
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+            
+    def _cancel_requested(self):
+        return self._stop_event.is_set()
+    
+    
+    def _raise_if_cancelled(self):
+        if self._cancel_requested():
+            raise EnaDownloadCancelled()
+    
+    
+    def _set_session(self, session):
+        with self._network_lock:
+            self._session = session
+    
+    
+    def _set_active_response(self, response):
+        with self._network_lock:
+            self._active_response = response
+    
+    
+    def _clear_active_response(self, response=None):
+        with self._network_lock:
+            if response is None or self._active_response is response:
+                self._active_response = None
         
     def _emit_done_once(self):
         if not self._emitted_done:
@@ -672,118 +1189,381 @@ class EnaDownloadWorker(QThread):
                 "progress": progress
             })
 
-    def _cleanup_output_dir(self):
-        if not self._output_created or not self._created_dir:
+    def _cleanup_working_dir(self):
+        working_dir = self._working_dir
+        self._working_dir = None
+    
+        if not working_dir or not os.path.exists(working_dir):
             return
+    
+        def handle_remove_error(func, path, exc_info):
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+            except Exception:
+                pass
+    
+        for _ in range(3):
+            try:
+                shutil.rmtree(
+                    working_dir,
+                    onerror=handle_remove_error
+                )
+                break
+    
+            except PermissionError:
+                time.sleep(0.1)
+    
+            except FileNotFoundError:
+                break
+    
+            except Exception:
+                break
+            
+    def _commit_working_dir(self, final_output_dir):
+    
+        self._raise_if_cancelled()
+    
+        if not self._working_dir:
+            raise RuntimeError("ENA working directory is not available.")
+    
+        backup_dir = None
+    
+        if os.path.exists(final_output_dir):
+            backup_dir = (
+                f"{final_output_dir}.backup_"
+                f"{int(time.time() * 1000)}"
+            )
+            os.replace(final_output_dir, backup_dir)
+    
         try:
-            if os.path.isdir(self._created_dir):
-                def _onerror(func, path, exc_info):
-                    try:
-                        os.chmod(path, stat.S_IWRITE)
-                        func(path)
-                    except Exception:
-                        pass
-                for _ in range(2):
-                    try:
-                        shutil.rmtree(self._created_dir, onerror=_onerror)
-                        break
-                    except PermissionError:
-                        time.sleep(0.1)
-                    except FileNotFoundError:
-                        break
+            os.replace(
+                self._working_dir,
+                final_output_dir
+            )
+            self._working_dir = None
+    
         except Exception:
-            pass
-        finally:
-            self._output_created = False
-            self._created_dir = None
+            if (
+                backup_dir
+                and os.path.exists(backup_dir)
+                and not os.path.exists(final_output_dir)
+            ):
+                os.replace(
+                    backup_dir,
+                    final_output_dir
+                )
+    
+            raise
+    
+        else:
+            if backup_dir and os.path.exists(backup_dir):
+                shutil.rmtree(
+                    backup_dir,
+                    ignore_errors=True
+                )
 
     def run(self):
         start_dt = datetime.now()
         start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
-        end_dt = None
-        elapsed_str = None
-
+    
         final_output_dir = None
+    
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "NGS-Data-Downloader/1.0"
+        })
+    
+        self._set_session(session)
+    
         try:
-            if self._stopped:
-                self._put_progress("❌ Canceled", 0)
-                self._cleanup_output_dir()
-                return
-
-            self._put_progress("Fetching ENA file info...", 5)
-
-            api_url = (
-                f"https://www.ebi.ac.uk/ena/portal/api/filereport"
-                f"?accession={self.run_acc}&result=read_run&fields=fastq_ftp"
+            self._raise_if_cancelled()
+            self._put_progress(
+                "Fetching ENA file info...",
+                0
             )
-            response = requests.get(api_url, timeout=60)
-            response.raise_for_status()
-
-            lines = response.text.strip().split("\n")
+    
+            api_url = (
+                "https://www.ebi.ac.uk/ena/portal/api/filereport"
+                f"?accession={self.run_acc}"
+                "&result=read_run"
+                "&fields=fastq_ftp"
+                "&format=tsv"
+            )
+    
+            response = None
+    
+            try:
+                self._raise_if_cancelled()
+    
+                response = session.get(
+                    api_url,
+                    timeout=(10, 10)
+                )
+    
+                self._set_active_response(response)
+    
+                response.raise_for_status()
+                self._raise_if_cancelled()
+    
+                response_text = response.text
+    
+            finally:
+                self._clear_active_response(response)
+    
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+    
+            self._raise_if_cancelled()
+            lines = response_text.splitlines()
+    
             if len(lines) < 2:
-                raise FileNotFoundError(f"No FASTQ files found for {self.run_acc} in ENA.")
-
-            fastq_ftp_urls = lines[1].strip().split("\t", 1)[-1]
-            fastq_files = fastq_ftp_urls.split(";") if ";" in fastq_ftp_urls else [fastq_ftp_urls]
-            fastq_files = [u.strip() for u in fastq_files if u.strip()]
-
+                raise FileNotFoundError(
+                    f"No FASTQ file information was returned for "
+                    f"{self.run_acc}."
+                )
+    
+            headers = lines[0].split("\t")
+            values = lines[1].split("\t")
+    
+            if len(values) < len(headers):
+                values.extend(
+                    [""] * (len(headers) - len(values))
+                )
+    
+            row = dict(zip(headers, values))
+    
+            fastq_ftp_urls = row.get(
+                "fastq_ftp",
+                ""
+            ).strip()
+    
+            if not fastq_ftp_urls:
+                raise FileNotFoundError(
+                    f"No downloadable FASTQ files are currently "
+                    f"available for {self.run_acc} in ENA."
+                )
+    
+            fastq_files = [
+                url.strip()
+                for url in fastq_ftp_urls.split(";")
+                if url.strip()
+            ]
+    
             if not fastq_files:
-                raise FileNotFoundError(f"No FASTQ files found for {self.run_acc} in ENA.")
+                raise FileNotFoundError(
+                    f"No downloadable FASTQ files are currently "
+                    f"available for {self.run_acc} in ENA."
+                )
+    
+            self._raise_if_cancelled()
 
-            final_output_dir = os.path.abspath(os.path.join(self.output_dir, self.run_acc))
-            os.makedirs(final_output_dir, exist_ok=True)
-            self._output_created = True 
-            self._created_dir = final_output_dir
+            final_output_dir = os.path.abspath(
+                os.path.join(
+                    self.output_dir,
+                    self.run_acc
+                )
+            )
+    
+            os.makedirs(
+                os.path.abspath(self.output_dir),
+                exist_ok=True
+            )
+    
+            self._working_dir = tempfile.mkdtemp(
+                prefix=f".{self.run_acc}.partial_",
+                dir=os.path.abspath(self.output_dir)
+            )
 
             for file_url in fastq_files:
-                if self._stopped:
-                    self._put_progress("❌ Canceled", 0)
-                    self._cleanup_output_dir()
-                    return
-
-                https_url = f"https://{file_url}"
-                file_name = os.path.basename(file_url)
-                output_file_path = os.path.join(final_output_dir, file_name)
-
-                self._put_progress("Downloading...", 50)
-
+                self._raise_if_cancelled()
+    
+                if file_url.startswith("ftp://"):
+                    https_url = (
+                        "https://"
+                        + file_url[len("ftp://"):]
+                    )
+    
+                elif file_url.startswith("https://"):
+                    https_url = file_url
+    
+                elif file_url.startswith(
+                    "ftp.sra.ebi.ac.uk/"
+                ):
+                    https_url = f"https://{file_url}"
+    
+                else:
+                    raise ValueError(
+                        f"Invalid ENA FASTQ URL returned for "
+                        f"{self.run_acc}: {file_url}"
+                    )
+    
+                file_name = os.path.basename(
+                    https_url.split("?", 1)[0]
+                )
+    
+                if not file_name:
+                    raise ValueError(
+                        f"Could not determine the FASTQ file name "
+                        f"for {self.run_acc}: {https_url}"
+                    )
+    
+                output_file_path = os.path.join(
+                    self._working_dir,
+                    file_name
+                )
+    
                 success = False
-                for attempt in range(1, 4):
+                max_attempts = 3
+                last_error = None
+
+                for attempt in range(
+                    1,
+                    max_attempts + 1
+                ):
+                    response = None
+    
                     try:
-                        with requests.get(https_url, stream=True, timeout=60) as r:
-                            r.raise_for_status()
-                            with open(output_file_path, "wb") as f:
-                                for chunk in r.iter_content(chunk_size=8192):
-                                    if self._stopped:
-                                        self._put_progress("❌ Canceled", 0)
-                                        self._cleanup_output_dir()
-                                        return
-                                    if chunk:
-                                        f.write(chunk)
+                        self._raise_if_cancelled()
+    
+                        self._put_progress(
+                            f"Downloading {file_name} "
+                            f"(Attempt {attempt}/{max_attempts})",
+                            0
+                        )
+    
+                        response = session.get(
+                            https_url,
+                            stream=True,
+                            timeout=(15, 60)
+                        )
+    
+
+                        self._set_active_response(
+                            response
+                        )
+    
+                        response.raise_for_status()
+                        self._raise_if_cancelled()
+    
+                        with open(
+                            output_file_path,
+                            "wb"
+                        ) as output_file:
+    
+                            for chunk in response.iter_content(
+                                chunk_size=1024 * 1024
+                            ):
+                                self._raise_if_cancelled()
+    
+                                if chunk:
+                                    output_file.write(
+                                        chunk
+                                    )
+    
+                        self._raise_if_cancelled()
+    
                         success = True
                         break
-                    except Exception:
-                        if self._stopped:
-                            self._put_progress("❌ Canceled", 0)
-                            self._cleanup_output_dir()
-                            return
-                        self._put_progress(f"Retry {attempt} failed for {file_name}", 40)
-                        time.sleep(5)
+    
+                    except EnaDownloadCancelled:
+                        raise
+    
+                    except Exception as e:
+                        last_error = e
+    
 
+                        if self._cancel_requested():
+                            raise EnaDownloadCancelled()
+    
+                        if attempt < max_attempts:
+                            self._put_progress(
+                                f"Download failed. Retrying "
+                                f"{file_name} "
+                                f"({attempt + 1}/{max_attempts})...",
+                                0
+                            )
+    
+                            if self._stop_event.wait(5):
+                                raise EnaDownloadCancelled()
+    
+                    finally:
+                        self._clear_active_response(
+                            response
+                        )
+    
+                        if response is not None:
+                            try:
+                                response.close()
+                            except Exception:
+                                pass
+    
                 if not success:
-                    self._put_progress("❌ Failed to download", 100)
-                    self.error.emit(f"Failed to download {file_name} after 3 attempts.")
-                    self._cleanup_output_dir()
+                    self.success = False
+    
+                    self._put_progress(
+                        f"❌ Failed to download {file_name}",
+                        0
+                    )
+    
+                    error_detail = (
+                        f": {last_error}"
+                        if last_error is not None
+                        else ""
+                    )
+    
+                    self.error.emit(
+                        f"Failed to download {file_name} "
+                        f"after {max_attempts} attempts"
+                        f"{error_detail}"
+                    )
+    
+                    self._cleanup_working_dir()
                     return
 
-            end_dt = datetime.now()
-            elapsed_str = str(end_dt - start_dt).split(".")[0]
-            total_size_mb = (
-                sum(os.path.getsize(os.path.join(final_output_dir, f)) for f in os.listdir(final_output_dir))
-                / (1024 * 1024)
-                if os.path.exists(final_output_dir) else 0
+            self._raise_if_cancelled()
+    
+            self._put_progress(
+                "Finalizing download...",
+                0
             )
-
+    
+            self._commit_working_dir(
+                final_output_dir
+            )
+    
+            end_dt = datetime.now()
+            elapsed_str = str(
+                end_dt - start_dt
+            ).split(".")[0]
+    
+            total_size_mb = 0
+    
+            if os.path.isdir(final_output_dir):
+                total_size_mb = (
+                    sum(
+                        os.path.getsize(
+                            os.path.join(
+                                final_output_dir,
+                                file_name
+                            )
+                        )
+                        for file_name in os.listdir(
+                            final_output_dir
+                        )
+                        if os.path.isfile(
+                            os.path.join(
+                                final_output_dir,
+                                file_name
+                            )
+                        )
+                    )
+                    / (1024 * 1024)
+                )
+    
             try:
                 log_metadata(
                     run_acc=self.run_acc,
@@ -791,27 +1571,73 @@ class EnaDownloadWorker(QThread):
                     metadata=self.metadata or {},
                     elapsed_time=elapsed_str,
                     start_time=start_str,
-                    end_time=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    end_time=end_dt.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
                     total_size=total_size_mb
                 )
+    
             except Exception as e:
-                print(f"[WARN] log_metadata failed for {self.run_acc}: {e}")
-
-            if self._stopped:
-                self._put_progress("❌ Canceled", 0)
-                self._cleanup_output_dir()
-                return
-
+                print(
+                    f"[WARN] log_metadata failed "
+                    f"for {self.run_acc}: {e}"
+                )
+    
             self.success = True
-            self._put_progress("✅ Download Completed", 100)
+    
+            self._put_progress(
+                "✅ Download Completed",
+                100
+            )
+    
             self.progress.emit(1)
 
+        except EnaDownloadCancelled:
+            self.success = False
+    
+            self._put_progress(
+                "🛑 Canceled",
+                0
+            )
+    
+            self._cleanup_working_dir()
+
         except Exception as e:
-            self._put_progress(f"❌ Error: {e}", 0)
-            self.error.emit(f"Exception for {self.run_acc}: {e}")
-            self._cleanup_output_dir()
+            self.success = False
+    
+            if self._cancel_requested():
+                self._put_progress(
+                    "🛑 Canceled",
+                    0
+                )
+    
+            else:
+                self._put_progress(
+                    f"❌ Error: {e}",
+                    0
+                )
+    
+                self.error.emit(
+                    f"Exception for "
+                    f"{self.run_acc}: {e}"
+                )
+    
+            self._cleanup_working_dir()
 
         finally:
+            self._clear_active_response()
+    
+            with self._network_lock:
+                if self._session is session:
+                    self._session = None
+    
+            try:
+                session.close()
+            except Exception:
+                pass
+
+            self._cleanup_working_dir()
+    
             self._emit_done_once()
             
 class CustomMessageBox(QDialog):
@@ -1478,28 +2304,62 @@ class MainApp(QMainWindow):
             self.ui.lineEditDirectory.setText(os.path.normpath(dir_path))
 
     def prepare_download_data(self):
-        selected_items = [self.ui.treeDownloadList.topLevelItem(i) for i in range(self.ui.treeDownloadList.topLevelItemCount())]
+        selected_items = [
+            self.ui.treeDownloadList.topLevelItem(i)
+            for i in range(
+                self.ui.treeDownloadList.topLevelItemCount()
+            )
+        ]
+    
         if not selected_items:
             return None, "Please add items to download list."
+    
         output_dir = self.ui.lineEditDirectory.text().strip()
+    
         if not output_dir:
             return None, "Please select an output directory."
+    
         selected_format = self.ui.comboFormat.currentText()
+        selected_database = (
+            self.ui.comboDatabase.currentText()
+            .strip()
+            .upper()
+        )
+    
         download_data = []
+    
         for item in selected_items:
-            metadata = {
-                "Run Accession": item.text(0),
-                "Title": item.text(1),
-                "Platform": item.text(2),
-                "Bases": item.text(3),
-                "Reads": item.text(4),
-                "Organism": item.text(5),
-                "Strategy": item.text(6),
-                "Bioproject": item.text(7),
-                "Biosample": item.text(8)
-            }
-            run_acc = metadata["Run Accession"]
-            download_data.append((run_acc, metadata))
+            run_acc = item.text(0)
+    
+            if selected_database == "ENA":
+                metadata = {
+                    "Database": "ENA",
+                    "Run Accession": run_acc,
+                    "Study Accession": item.text(1),
+                    "Sample Accession": item.text(2),
+                    "Organism": item.text(3),
+                    "Instrument Model": item.text(4),
+                    "Library Strategy": item.text(5)
+                }
+    
+            else:
+                metadata = {
+                    "Database": "SRA",
+                    "Run Accession": run_acc,
+                    "Title": item.text(1),
+                    "Platform": item.text(2),
+                    "Bases": item.text(3),
+                    "Reads": item.text(4),
+                    "Organism": item.text(5),
+                    "Strategy": item.text(6),
+                    "Bioproject": item.text(7),
+                    "Biosample": item.text(8)
+                }
+    
+            download_data.append(
+                (run_acc, metadata)
+            )
+    
         return {
             "download_items": download_data,
             "output_dir": output_dir,
@@ -1739,57 +2599,197 @@ class ConversionRunner(QObject):
         self.finished.emit(False)
         return False 
     
-def log_metadata(run_acc, output_dir, metadata, elapsed_time,
-                 start_time=None, end_time=None, total_size=None):
+def log_metadata(
+    run_acc,
+    output_dir,
+    metadata,
+    elapsed_time,
+    start_time=None,
+    end_time=None,
+    total_size=None
+):
     global log_file_name
 
-    if log_file_name is None:
-        log_file_name = f"NGS_data_downloader_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    database = (
+        metadata.get("Database", "SRA")
+        .strip()
+        .upper()
+    )
 
-    log_file_path = os.path.join(output_dir, log_file_name)
+    if log_file_name is None:
+        log_file_name = (
+            f"NGS_data_downloader_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        )
+
+    base_name, extension = os.path.splitext(
+        log_file_name
+    )
+
+    database_log_name = (
+        f"{base_name}_{database}{extension}"
+    )
+
+    log_file_path = os.path.join(
+        output_dir,
+        database_log_name
+    )
 
     with log_lock:
-        file_exists = os.path.exists(log_file_path)
+        file_exists = os.path.exists(
+            log_file_path
+        )
 
-        with open(log_file_path, mode="a", newline="", encoding="utf-8") as log_file:
+        if total_size is None:
+            final_output_dir = os.path.abspath(
+                os.path.join(
+                    output_dir,
+                    run_acc
+                )
+            )
+
+            if os.path.isdir(final_output_dir):
+                total_size = (
+                    sum(
+                        os.path.getsize(
+                            os.path.join(
+                                final_output_dir,
+                                file_name
+                            )
+                        )
+                        for file_name in os.listdir(
+                            final_output_dir
+                        )
+                        if os.path.isfile(
+                            os.path.join(
+                                final_output_dir,
+                                file_name
+                            )
+                        )
+                    )
+                    / (1024 * 1024)
+                )
+            else:
+                total_size = None
+
+        formatted_size = (
+            f"{total_size:.2f} MB"
+            if isinstance(
+                total_size,
+                (int, float)
+            )
+            else "N/A"
+        )
+
+        with open(
+            log_file_path,
+            mode="a",
+            newline="",
+            encoding="utf-8-sig"
+        ) as log_file:
             writer = csv.writer(log_file)
 
-            if not file_exists:
+            if database == "ENA":
+                if not file_exists:
+                    writer.writerow([
+                        "Run Accession",
+                        "Study Accession",
+                        "Sample Accession",
+                        "Organism",
+                        "Instrument Model",
+                        "Library Strategy",
+                        "Start Time",
+                        "End Time",
+                        "Elapsed Time",
+                        "Size (MB)"
+                    ])
+
                 writer.writerow([
-                    "Run Accession", "Title", "Platform", "Bases", "Reads",
-                    "Organism", "Strategy", "Bioproject", "Biosample",
-                    "Start Time", "End Time", "Elapsed Time", "Size (MB)"
+                    run_acc,
+                    metadata.get(
+                        "Study Accession",
+                        "N/A"
+                    ),
+                    metadata.get(
+                        "Sample Accession",
+                        "N/A"
+                    ),
+                    metadata.get(
+                        "Organism",
+                        "N/A"
+                    ),
+                    metadata.get(
+                        "Instrument Model",
+                        "N/A"
+                    ),
+                    metadata.get(
+                        "Library Strategy",
+                        "N/A"
+                    ),
+                    start_time or "N/A",
+                    end_time or "N/A",
+                    elapsed_time,
+                    formatted_size
                 ])
 
-            if total_size is None:
-                final_output_dir = os.path.abspath(os.path.join(output_dir, run_acc))
-                if os.path.exists(final_output_dir):
-                    total_size = sum(
-                        os.path.getsize(os.path.join(final_output_dir, f))
-                        for f in os.listdir(final_output_dir)
-                        if os.path.isfile(os.path.join(final_output_dir, f))
-                    ) / (1024 * 1024)
-                else:
-                    total_size = "N/A"
+            else:
+                if not file_exists:
+                    writer.writerow([
+                        "Run Accession",
+                        "Title",
+                        "Platform",
+                        "Bases",
+                        "Reads",
+                        "Organism",
+                        "Strategy",
+                        "Bioproject",
+                        "Biosample",
+                        "Start Time",
+                        "End Time",
+                        "Elapsed Time",
+                        "Size (MB)"
+                    ])
 
-            formatted_size = f"{total_size:.2f} MB" if isinstance(total_size, (int, float)) else "N/A"
-
-            writer.writerow([
-                run_acc,
-                metadata.get("Title", "N/A"),
-                metadata.get("Platform", "N/A"),
-                metadata.get("Bases", "N/A"),
-                metadata.get("Reads", "N/A"),
-                metadata.get("Organism", "N/A"),
-                metadata.get("Strategy", "N/A"),
-                metadata.get("Bioproject", "N/A"),
-                metadata.get("Biosample", "N/A"),
-                start_time or "N/A",
-                end_time or "N/A",
-                elapsed_time,
-                formatted_size
-            ])
-           
+                writer.writerow([
+                    run_acc,
+                    metadata.get(
+                        "Title",
+                        "N/A"
+                    ),
+                    metadata.get(
+                        "Platform",
+                        "N/A"
+                    ),
+                    metadata.get(
+                        "Bases",
+                        "N/A"
+                    ),
+                    metadata.get(
+                        "Reads",
+                        "N/A"
+                    ),
+                    metadata.get(
+                        "Organism",
+                        "N/A"
+                    ),
+                    metadata.get(
+                        "Strategy",
+                        "N/A"
+                    ),
+                    metadata.get(
+                        "Bioproject",
+                        "N/A"
+                    ),
+                    metadata.get(
+                        "Biosample",
+                        "N/A"
+                    ),
+                    start_time or "N/A",
+                    end_time or "N/A",
+                    elapsed_time,
+                    formatted_size
+                ])
+                
 def select_all_items(tree_widget: QTreeWidget):
     total_count = tree_widget.topLevelItemCount()
     selected_count = len(tree_widget.selectedItems())
